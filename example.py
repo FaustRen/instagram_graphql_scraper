@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-from instagram_graphql_scraper.instagram_graphql_scraper import InstagramGraphqlScraper as ig_graphql_scraper
+if __package__:
+    from . import InstagramGraphqlScraper as ig_graphql_scraper
+else:
+    from scraper import InstagramGraphqlScraper as ig_graphql_scraper
 
 
 ## Example.1 - without logging in

@@ -1,11 +1,12 @@
 # -*- coding:utf-8 -*-
 from seleniumwire import webdriver
 from selenium.webdriver.chrome.service import Service
+from typing import Optional
 
 class BasePage:
-    def __init__(self, driver_path: str, open_browser: bool = False):
+    def __init__(self, driver_path: Optional[str] = None, open_browser: bool = False):
         chrome_options = self._build_options(open_browser)
-        service = Service(driver_path)
+        service = Service(driver_path) if driver_path else Service()
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
         if open_browser:
             self.driver.maximize_window()

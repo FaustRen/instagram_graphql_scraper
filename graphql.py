@@ -1,0 +1,228 @@
+import gzip
+import json
+import logging
+import re
+import zlib
+from collections.abc import Mapping
+from typing import Any
+from urllib.parse import parse_qsl, urlparse
+
+try:
+    from .models import CapturedRequest
+except ImportError:
+    from models import CapturedRequest
+
+OPERATION_NAME = "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery_connection"
+GRAPHQL_PATH = "/api/graphql"
+SENSITIVE_HEADERS = {"authorization", "cookie", "x-csrftoken", "x-fb-lsd"}
+TRANSPORT_HEADERS = {
+    "content-length", "host", "connection", "accept-encoding", ":authority",
+    ":method", ":path", ":scheme", "cookie",
+}
+
+
+class InstagramGraphQLError(ValueError):
+    pass
+
+
+def _headers(request: Any) -> dict[str, str]:
+    return {str(key): str(value) for key, value in getattr(request, "headers", {}).items()}
+
+
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    name = name.lower()
+    return next((value for key, value in headers.items() if key.lower() == name), None)
+
+
+def parse_form_payload(body: bytes | str | None) -> tuple[dict[str, str], dict[str, Any]]:
+    if body is None:
+        raise InstagramGraphQLError("GraphQL request has an empty body")
+    text = body.decode("utf-8") if isinstance(body, bytes) else body
+    payload = dict(parse_qsl(text, keep_blank_values=True))
+    if not payload:
+        raise InstagramGraphQLError("GraphQL request body is not form-urlencoded")
+    if "variables" not in payload:
+        raise InstagramGraphQLError("GraphQL request payload has no variables")
+    try:
+        variables = json.loads(payload["variables"])
+    except json.JSONDecodeError as error:
+        raise InstagramGraphQLError("GraphQL variables are not valid JSON") from error
+    if not isinstance(variables, dict):
+        raise InstagramGraphQLError("GraphQL variables must be a JSON object")
+    return payload, variables
+
+
+def decode_response_body(body: bytes | str | None, encoding: str | None) -> dict[str, Any]:
+    if not body:
+        raise InstagramGraphQLError("GraphQL response body is empty")
+    raw = body.encode("utf-8") if isinstance(body, str) else body
+    content_encoding = (encoding or "identity").lower().strip()
+    try:
+        if content_encoding not in {"identity", ""}:
+            try:
+                from seleniumwire.utils import decode
+                raw = decode(raw, content_encoding)
+                content_encoding = "identity"
+            except (ImportError, OSError, ValueError):
+                pass
+        if content_encoding == "gzip":
+            raw = gzip.decompress(raw)
+        elif content_encoding == "deflate":
+            raw = zlib.decompress(raw)
+        elif content_encoding == "br":
+            import brotli
+            raw = brotli.decompress(raw)
+        value = json.loads(raw.decode("utf-8"))
+    except (ImportError, OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstagramGraphQLError("GraphQL response is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise InstagramGraphQLError("GraphQL response JSON must be an object")
+    return value
+
+
+def request_debug_summary(requests: Any) -> str:
+    """Return request diagnostics without exposing headers, cookies, or bodies."""
+    summaries = []
+    for request in requests:
+        parsed_url = urlparse(str(getattr(request, "url", "")))
+        if parsed_url.path != GRAPHQL_PATH:
+            continue
+        response = getattr(request, "response", None)
+        headers = _headers(request)
+        operation = _header(headers, "x-fb-friendly-name")
+        status = getattr(response, "status_code", "no-response") if response else "no-response"
+        encoding = _header(getattr(response, "headers", {}), "content-encoding") if response else None
+        schema = False
+        if response:
+            try:
+                schema = _connection(decode_response_body(response.body, encoding)) is not None
+            except Exception:
+                pass
+        summaries.append(f"status={status}, operation={operation or '<none>'}, encoding={encoding or 'identity'}, timeline_schema={schema}")
+    return f"graphql_requests={len(summaries)} [{'; '.join(summaries[-10:])}]"
+
+
+def _connection(response_json: Mapping[str, Any]) -> Mapping[str, Any]:
+    try:
+        connection = response_json["data"]["node"]["polaris_ordered_timeline_connection"]
+        edges = connection["edges"]
+        page_info = connection["page_info"]
+    except (KeyError, TypeError) as error:
+        raise InstagramGraphQLError(
+            "GraphQL response missing data.node.polaris_ordered_timeline_connection"
+        ) from error
+    if not isinstance(connection, Mapping) or not isinstance(edges, list) or not isinstance(page_info, Mapping):
+        raise InstagramGraphQLError("Instagram timeline connection has an invalid schema")
+    return connection
+
+
+def parse_connection(response_json: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str | None, bool]:
+    connection = _connection(response_json)
+    posts = [normalize_edge(edge) for edge in connection["edges"]]
+    page_info = connection["page_info"]
+    return posts, page_info.get("end_cursor"), bool(page_info.get("has_next_page", False))
+
+
+def normalize_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
+    node = edge.get("node") if isinstance(edge, Mapping) else None
+    if not isinstance(node, Mapping):
+        raise InstagramGraphQLError("Instagram timeline edge has no node")
+    shortcode = node.get("code")
+    user_value = node.get("user")
+    user = user_value if isinstance(user_value, Mapping) else {}
+    return {
+        "post_id": node.get("pk"),
+        "graphql_id": node.get("id"),
+        "shortcode": shortcode,
+        "post_url": f"https://www.instagram.com/p/{shortcode}/" if shortcode else None,
+        "caption": (node.get("caption") or {}).get("text") if isinstance(node.get("caption"), Mapping) else None,
+        "accessibility_caption": node.get("accessibility_caption"),
+        "typename": node.get("__typename"),
+        "media_type": node.get("media_type"),
+        "product_type": node.get("product_type"),
+        "is_video": node.get("media_type") == 2,
+        "display_uri": node.get("display_uri"),
+        "carousel_media_count": node.get("carousel_media_count"),
+        "username": user.get("username"),
+        "user_pk": user.get("pk"),
+        "user_graphql_id": user.get("id"),
+        "edge_cursor": edge.get("cursor"),
+    }
+
+
+def replay_headers(raw_headers: Mapping[str, str], cookies: Mapping[str, str]) -> dict[str, str]:
+    csrf = cookies.get("csrftoken")
+    result = {}
+    for key, value in raw_headers.items():
+        lower_key = key.lower()
+        if lower_key in TRANSPORT_HEADERS:
+            continue
+        result[key] = value
+    if csrf:
+        result["X-Csrftoken"] = csrf
+    return result
+
+
+def redact_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: "<redacted>" if key.lower() in SENSITIVE_HEADERS or re.search("token|cookie|authorization", key, re.I) else value
+        for key, value in headers.items()
+    }
+
+
+def is_target_graphql_request(request: Any, logger: logging.Logger | None = None) -> bool:
+    headers = _headers(request)
+    parsed_url = urlparse(str(getattr(request, "url", "")))
+    if str(getattr(request, "method", "")).upper() != "POST" or parsed_url.path != GRAPHQL_PATH:
+        return False
+    response = getattr(request, "response", None)
+    if response is None or not 200 <= int(getattr(response, "status_code", 0)) < 300:
+        return False
+    try:
+        payload, _ = parse_form_payload(getattr(request, "body", None))
+        operation = _header(headers, "x-fb-friendly-name") or payload.get("fb_api_req_friendly_name")
+        response_json = decode_response_body(getattr(response, "body", None), _header(response.headers, "content-encoding"))
+        _connection(response_json)
+    except InstagramGraphQLError:
+        return False
+    if operation == OPERATION_NAME:
+        return True
+    if logger:
+        logger.warning("Accepted GraphQL request with schema match but unexpected operation name")
+    return True
+
+
+def capture_request(request: Any, cookies: Mapping[str, str]) -> CapturedRequest:
+    if not is_target_graphql_request(request):
+        raise InstagramGraphQLError("Request does not match the Instagram profile posts GraphQL request")
+    raw_headers = _headers(request)
+    form_payload, variables = parse_form_payload(request.body)
+    response = request.response
+    response_json = decode_response_body(response.body, _header(response.headers, "content-encoding"))
+    posts, end_cursor, has_next_page = parse_connection(response_json)
+    operation = _header(raw_headers, "x-fb-friendly-name") or form_payload.get("fb_api_req_friendly_name")
+    return CapturedRequest(
+        url=request.url,
+        operation_name=operation,
+        raw_headers=raw_headers,
+        replay_headers=replay_headers(raw_headers, cookies),
+        cookies=dict(cookies),
+        form_payload=form_payload,
+        variables=variables,
+        doc_id=form_payload.get("doc_id"),
+        first_response=response_json,
+        end_cursor=end_cursor,
+        has_next_page=has_next_page,
+    )
+
+
+def next_payload(captured: CapturedRequest, cursor: str) -> dict[str, str]:
+    payload = dict(captured.form_payload)
+    variables = dict(captured.variables)
+    variables["after"] = cursor
+    payload["variables"] = json.dumps(variables, separators=(",", ":"))
+    return payload
+
+
+def log_capture(logger: logging.Logger, captured: CapturedRequest) -> None:
+    logger.debug("Captured Instagram GraphQL request operation=%s doc_id=%s headers=%s", captured.operation_name, captured.doc_id, redact_headers(captured.raw_headers))
