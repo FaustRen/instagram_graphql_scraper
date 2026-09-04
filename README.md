@@ -2,6 +2,14 @@
 
 Collects posts from a public Instagram profile by capturing the browser's profile GraphQL request, then replaying subsequent pages through one `requests.Session`.
 
+## Installation
+
+```bash
+pip install -r requirements.txt
+# or
+pip install -e .
+```
+
 ## Usage
 
 ```python
@@ -31,3 +39,7 @@ python3 manual_integration.py 1989ivyshao --driver-path /path/to/chromedriver --
 ```
 
 Do not place cookies, CSRF/LSD tokens, or captured payloads in source, fixtures, or logs.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

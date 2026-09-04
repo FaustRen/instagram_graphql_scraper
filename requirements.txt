@@ -1,0 +1,4 @@
+selenium>=4.20
+selenium-wire>=5.1
+requests>=2.31
+brotli>=1.1

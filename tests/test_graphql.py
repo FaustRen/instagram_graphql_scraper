@@ -69,6 +69,42 @@ def test_parse_all_media_types_and_optional_fields():
     assert posts[2]["user_pk"] is None
 
 
+def test_parse_counts_and_timestamp_without_guessing_from_accessibility_caption():
+    response = json.loads(make_response(posts=[{
+        "pk": "1",
+        "id": "POLARIS_1",
+        "code": "video1",
+        "media_type": 2,
+        "like_count": 11,
+        "edge_media_to_comment": {"count": 4},
+        "video_view_count": 99,
+        "taken_at_timestamp": 1785067200,
+        "accessibility_caption": "Video posted yesterday",
+    }]).body)
+    posts, _, _ = parse_connection(response)
+    assert posts[0]["like_count"] == 11
+    assert posts[0]["comment_count"] == 4
+    assert posts[0]["video_view_count"] == 99
+    assert posts[0]["taken_at_timestamp"] == 1785067200
+    assert posts[0]["published_at"].startswith("2026-07-26T")
+
+
+def test_parse_nested_metrics_when_timeline_returns_them():
+    response = json.loads(make_response(posts=[{
+        "pk": "1",
+        "id": "POLARIS_1",
+        "code": "post1",
+        "media_type": 1,
+        "media": {
+            "edge_media_preview_like": {"count": 12},
+            "edge_media_to_comment": {"count": 3},
+        },
+    }]).body)
+    posts, _, _ = parse_connection(response)
+    assert posts[0]["like_count"] == 12
+    assert posts[0]["comment_count"] == 3
+
+
 def test_end_cursor_comes_from_page_info():
     response = json.loads(make_response(end_cursor="page-info-cursor").body)
     _, cursor, _ = parse_connection(response)

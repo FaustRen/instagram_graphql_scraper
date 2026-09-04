@@ -4,6 +4,7 @@ import logging
 import re
 import zlib
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
@@ -130,6 +131,15 @@ def normalize_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
     shortcode = node.get("code")
     user_value = node.get("user")
     user = user_value if isinstance(user_value, Mapping) else {}
+    taken_at_timestamp = _first_value(
+        node,
+        "taken_at_timestamp",
+        "taken_at",
+        "timestamp",
+        "created_time",
+    )
+    if not isinstance(taken_at_timestamp, (int, float)) or isinstance(taken_at_timestamp, bool):
+        taken_at_timestamp = None
     return {
         "post_id": node.get("pk"),
         "graphql_id": node.get("id"),
@@ -147,7 +157,47 @@ def normalize_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
         "user_pk": user.get("pk"),
         "user_graphql_id": user.get("id"),
         "edge_cursor": edge.get("cursor"),
+        "like_count": _count_value(node, "like_count", "likes", "edge_media_preview_like"),
+        "comment_count": _count_value(node, "comment_count", "comments", "edge_media_to_comment"),
+        "video_view_count": _count_value(node, "video_view_count", "view_count", "play_count", "video_play_count"),
+        "taken_at_timestamp": taken_at_timestamp,
+        "published_at": (
+            datetime.fromtimestamp(taken_at_timestamp, tz=timezone.utc).isoformat()
+            if taken_at_timestamp is not None else None
+        ),
     }
+
+
+def _first_value(value: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in value and value[key] is not None:
+            return value[key]
+    return None
+
+
+def _count_value(node: Mapping[str, Any], *keys: str) -> Any:
+    value = _first_value(node, *keys)
+    if value is None:
+        value = _find_nested_value(node, set(keys))
+    if isinstance(value, Mapping):
+        value = value.get("count")
+    return value
+
+
+def _find_nested_value(value: Any, keys: set[str]) -> Any:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key in keys and child is not None:
+                return child
+            nested = _find_nested_value(child, keys)
+            if nested is not None:
+                return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _find_nested_value(child, keys)
+            if nested is not None:
+                return nested
+    return None
 
 
 def replay_headers(raw_headers: Mapping[str, str], cookies: Mapping[str, str]) -> dict[str, str]:
