@@ -18,7 +18,7 @@ from graphql import (
 from models import CapturedRequest
 from scraper import InstagramGraphqlScraper
 from detail import merge_post_detail, parse_post_detail_html
-from embed import InstagramEmbedClient
+from embed import InstagramEmbedClient, normalize_embed_html
 from instagram_context_json import extract_context_json, normalize_media
 import httpx
 
@@ -318,3 +318,26 @@ def test_async_embed_retries_503_but_not_404():
     assert results[0]["like_count"] == 12
     assert results[1]["error"] == "HTTP 404"
     assert attempts == {"temporary": 2, "missing": 1}
+
+
+def test_context_json_null_uses_exact_html_metrics_fallback():
+    html = '<script>contextJSON:null</script>'
+    html += '<a data-log-event="likeCountClick">42,318 likes</a>'
+    html += '<a data-log-event="captionCommentsClick">View all 190 comments</a>'
+    detail = normalize_embed_html(html, "DasJmTqJ_QI")
+    assert detail["shortcode"] == "DasJmTqJ_QI"
+    assert detail["like_count"] == 42318
+    assert detail["comment_count"] == 190
+    assert detail["detail_source"] == "post_embed_html"
+
+
+def test_merge_includes_video_detail_fields():
+    post = {"shortcode": "video", "video_view_count": None, "video_duration": None, "video_url": None}
+    merge_post_detail(post, {
+        "video_view_count": 414739,
+        "video_duration": 140.966,
+        "video_url": "https://example.com/video.mp4",
+    })
+    assert post["video_view_count"] == 414739
+    assert post["video_duration"] == 140.966
+    assert post["video_url"] == "https://example.com/video.mp4"

@@ -88,6 +88,7 @@ def normalize_media(media: dict[str, Any]) -> dict[str, Any]:
         "video_url": media.get("video_url") if is_video else None,
         "username": owner.get("username"),
         "user_pk": owner.get("id"),
+        "detail_source": "post_embed_html",
     }
 
 

@@ -7,6 +7,11 @@ from typing import Any
 import httpx
 
 try:
+    from .detail import parse_post_detail_html
+except ImportError:
+    from detail import parse_post_detail_html
+
+try:
     from .instagram_context_json import extract_context_json, get_media, normalize_media
 except ImportError:
     from instagram_context_json import extract_context_json, get_media, normalize_media
@@ -79,7 +84,7 @@ class InstagramEmbedClient:
                 if response.status_code == 429 or response.status_code >= 500:
                     response.raise_for_status()
                 response.raise_for_status()
-                return normalize_media(get_media(extract_context_json(response.text)))
+                return normalize_embed_html(response.text, shortcode)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as error:
                 last_error = error
                 if attempt < self.max_retries:
@@ -118,3 +123,14 @@ async def fetch_posts_embed(
 ) -> list[dict[str, Any]]:
     async with InstagramEmbedClient(max_concurrency, timeout, max_retries) as client:
         return await client.fetch_many(posts)
+
+
+def normalize_embed_html(html: str, shortcode: str | None = None) -> dict[str, Any]:
+    try:
+        context = extract_context_json(html)
+        return normalize_media(get_media(context))
+    except (ValueError, KeyError) as error:
+        fallback = parse_post_detail_html(html, shortcode)
+        if fallback.get("detail_source"):
+            return fallback
+        raise ValueError(str(error)) from error

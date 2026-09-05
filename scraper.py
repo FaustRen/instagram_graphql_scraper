@@ -5,9 +5,9 @@ from typing import Any
 import requests
 
 try:
-    from .embed import InstagramEmbedClient
+    from .embed import InstagramEmbedClient, normalize_embed_html
 except ImportError:
-    from embed import InstagramEmbedClient
+    from embed import InstagramEmbedClient, normalize_embed_html
 
 try:
     from .detail import merge_post_detail, parse_post_detail_html
@@ -188,7 +188,7 @@ class InstagramGraphqlScraper:
                     detail_path = "reel" if post.get("media_type") == 2 else "p"
                     embed_url = f"https://www.instagram.com/{detail_path}/{shortcode}/embed/captioned/"
                     response = self._get_detail_response(embed_url)
-                    cache[shortcode] = parse_post_detail_html(response.text, shortcode)
+                    cache[shortcode] = normalize_embed_html(response.text, shortcode)
                     if cache[shortcode].get("taken_at_timestamp") is None:
                         page_url = f"https://www.instagram.com/{detail_path}/{shortcode}/"
                         page_detail = parse_post_detail_html(self._get_detail_response(page_url).text, shortcode)
@@ -223,13 +223,7 @@ class InstagramGraphqlScraper:
             detail = details_by_shortcode.get(post.get("shortcode"))
             if not detail or detail.get("error"):
                 continue
-            for field in (
-                "like_count", "comment_count", "video_view_count",
-                "video_duration", "video_url", "display_uri",
-                "product_type", "media_type", "is_video",
-            ):
-                if post.get(field) is None and detail.get(field) is not None:
-                    post[field] = detail[field]
+            merge_post_detail(post, detail)
         return posts
 
     def _get_detail_response(self, url: str, retries: int = 3) -> requests.Response:

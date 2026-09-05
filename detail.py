@@ -108,6 +108,7 @@ def parse_post_detail_html(html: str, shortcode: str | None = None) -> dict[str,
     if published_at is None:
         published_at = _parse_description_date(description)
     return {
+        "shortcode": shortcode,
         "like_count": like_count,
         "comment_count": comment_count,
         "video_view_count": video_view_count,
@@ -121,7 +122,11 @@ def parse_post_detail_html(html: str, shortcode: str | None = None) -> dict[str,
 
 
 def merge_post_detail(post: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
-    for field in ("like_count", "comment_count", "video_view_count", "taken_at_timestamp", "published_at"):
+    for field in (
+        "like_count", "comment_count", "video_view_count", "video_duration",
+        "video_url", "display_uri", "product_type", "media_type", "is_video",
+        "taken_at_timestamp", "published_at",
+    ):
         if post.get(field) is None and detail.get(field) is not None:
             post[field] = detail[field]
     for field in ("like_count_is_approximate", "comment_count_is_approximate", "detail_source"):
