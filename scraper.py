@@ -5,6 +5,11 @@ from typing import Any
 import requests
 
 try:
+    from .detail import merge_post_detail, parse_post_detail_html
+except ImportError:
+    from detail import merge_post_detail, parse_post_detail_html
+
+try:
     from .graphql import (
         InstagramGraphQLError,
         capture_request,
@@ -37,6 +42,7 @@ class InstagramGraphqlScraper:
         ig_account: str | None = None,
         ig_pwd: str | None = None,
         logger: logging.Logger | None = None,
+        enrich_details: bool = True,
     ):
         self.logger = logger or logging.getLogger(__name__)
         self._owns_driver = driver is None
@@ -47,6 +53,7 @@ class InstagramGraphqlScraper:
         self.ig_pwd = ig_pwd
         self.session = requests.Session()
         self.captured_request: CapturedRequest | None = None
+        self.enrich_details = enrich_details
 
     def _build_driver(self) -> Any:
         if self.driver is not None:
@@ -153,12 +160,74 @@ class InstagramGraphqlScraper:
             if display_progress:
                 print(f"Collected {len(posts)} Instagram posts")
             if max_posts is not None and len(posts) >= max_posts:
-                return posts[:max_posts]
+                posts = posts[:max_posts]
+                break
             if not next_cursor or next_cursor in seen_cursors:
                 self.logger.warning("Stopping pagination because end_cursor repeated or is empty")
                 break
             cursor = next_cursor
-        return posts[:max_posts] if max_posts is not None else posts
+        posts = posts[:max_posts] if max_posts is not None else posts
+        if self.enrich_details:
+            self.enrich_posts(posts)
+        return posts
+
+    def enrich_posts(self, posts: list[dict[str, Any]]) -> None:
+        cache: dict[str, dict[str, Any]] = {}
+        consecutive_failures = 0
+        for post in posts:
+            shortcode = post.get("shortcode")
+            if not shortcode:
+                continue
+            if shortcode not in cache:
+                try:
+                    detail_path = "reel" if post.get("media_type") == 2 else "p"
+                    embed_url = f"https://www.instagram.com/{detail_path}/{shortcode}/embed/captioned/"
+                    response = self._get_detail_response(embed_url)
+                    cache[shortcode] = parse_post_detail_html(response.text, shortcode)
+                    if cache[shortcode].get("taken_at_timestamp") is None:
+                        page_url = f"https://www.instagram.com/{detail_path}/{shortcode}/"
+                        page_detail = parse_post_detail_html(self._get_detail_response(page_url).text, shortcode)
+                        for field in ("taken_at_timestamp", "published_at"):
+                            if cache[shortcode].get(field) is None:
+                                cache[shortcode][field] = page_detail.get(field)
+                    consecutive_failures = 0
+                except (requests.RequestException, ValueError) as error:
+                    self.logger.warning("Post detail enrichment failed for shortcode=%s: %s", shortcode, error)
+                    cache[shortcode] = {}
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        self.logger.warning("Post detail enrichment disabled for remaining posts")
+                        break
+            merge_post_detail(post, cache[shortcode])
+
+    def _get_detail_response(self, url: str, retries: int = 3) -> requests.Response:
+        last_error: requests.RequestException | None = None
+        detail_headers = {
+            key: value
+            for key, value in self.session.headers.items()
+            if key.lower() not in {
+                "content-type", "x-fb-friendly-name", "x-fb-lsd",
+                "x-csrftoken", "fb_api_req_friendly_name",
+            }
+        }
+        detail_headers["Accept"] = "text/html,application/xhtml+xml"
+        for attempt in range(retries):
+            try:
+                response = self.session.get(url, headers=detail_headers, timeout=30)
+                if response.status_code in (401, 403):
+                    response.raise_for_status()
+                if response.status_code == 429 or response.status_code >= 500:
+                    response.raise_for_status()
+                response.raise_for_status()
+                return response
+            except requests.RequestException as error:
+                last_error = error
+                status_code = getattr(error.response, "status_code", None)
+                if attempt + 1 < retries and (status_code is None or status_code == 429 or status_code >= 500):
+                    time.sleep(2**attempt)
+                else:
+                    break
+        raise last_error or requests.RequestException("Instagram detail request failed")
 
     def close(self) -> None:
         if self.driver is not None and self._owns_driver:

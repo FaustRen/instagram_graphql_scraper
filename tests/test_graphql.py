@@ -16,6 +16,7 @@ from graphql import (
 )
 from models import CapturedRequest
 from scraper import InstagramGraphqlScraper
+from detail import merge_post_detail, parse_post_detail_html
 
 
 OPERATION = "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery_connection"
@@ -146,3 +147,61 @@ def test_repeated_cursor_stops_pagination():
 def test_empty_response_is_rejected():
     with pytest.raises(InstagramGraphQLError, match="empty"):
         decode_response_body(b"", "identity")
+
+
+def test_post_detail_html_parses_exact_counts_and_timestamp():
+    html = '<meta name="description" content="9,961 likes, 65 comments - demo on July 5, 2026">'
+    html += '<time datetime="2026-07-05T12:34:56.000Z">July 5</time>'
+    detail = parse_post_detail_html(html, "CODE")
+    assert detail["like_count"] == 9961
+    assert detail["comment_count"] == 65
+    assert detail["taken_at_timestamp"] == 1783254896
+    assert detail["published_at"] == "2026-07-05T12:34:56+00:00"
+    assert detail["like_count_is_approximate"] is False
+
+
+def test_post_detail_html_marks_rounded_counts_and_reads_video_views():
+    detail = parse_post_detail_html('<meta property="og:description" content="14K likes, 60 comments, 2.5K views">')
+    assert detail["like_count"] == 14000
+    assert detail["comment_count"] == 60
+    assert detail["video_view_count"] == 2500
+    assert detail["like_count_is_approximate"] is True
+
+
+def test_post_embed_html_prefers_exact_anchor_counts_over_rounded_description():
+    html = '<meta name="description" content="14K likes, 60 comments - demo on July 26, 2026">'
+    html += '<a data-log-event="likeCountClick">7,320,872 likes</a>'
+    html += '<a data-log-event="captionCommentsClick">View all 62,125 comments</a>'
+    detail = parse_post_detail_html(html, "CODE")
+    assert detail["like_count"] == 7320872
+    assert detail["comment_count"] == 62125
+    assert detail["like_count_is_approximate"] is False
+    assert detail["detail_source"] == "post_embed_html"
+
+
+def test_post_embed_html_parses_structured_exact_counts_when_anchor_variant_changes():
+    html = r'''<script>"edge_media_to_comment":{"count":62125},"edge_liked_by":{"count":7320872}</script>'''
+    detail = parse_post_detail_html(html, "CODE")
+    assert detail["like_count"] == 7320872
+    assert detail["comment_count"] == 62125
+    assert detail["detail_source"] == "post_embed_html"
+
+
+def test_post_detail_html_missing_fields_are_none():
+    detail = parse_post_detail_html("<html><body>No metrics</body></html>")
+    assert detail["like_count"] is None
+    assert detail["comment_count"] is None
+    assert detail["taken_at_timestamp"] is None
+    assert detail["published_at"] is None
+
+
+def test_post_detail_html_uses_date_only_fallback_without_fake_timestamp():
+    detail = parse_post_detail_html('<meta name="description" content="1,797 likes, 13 comments - demo on June 16, 2026">')
+    assert detail["published_at"] == "2026-06-16"
+    assert detail["taken_at_timestamp"] is None
+
+
+def test_detail_merge_does_not_overwrite_existing_exact_values():
+    post = {"like_count": 10, "comment_count": None, "published_at": "2026-07-05"}
+    merge_post_detail(post, {"like_count": 20, "comment_count": 4, "published_at": "2026-07-05T12:34:56+00:00"})
+    assert post == {"like_count": 10, "comment_count": 4, "published_at": "2026-07-05"}
