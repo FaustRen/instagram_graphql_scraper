@@ -5,6 +5,11 @@ from typing import Any
 import requests
 
 try:
+    from .embed import InstagramEmbedClient
+except ImportError:
+    from embed import InstagramEmbedClient
+
+try:
     from .detail import merge_post_detail, parse_post_detail_html
 except ImportError:
     from detail import merge_post_detail, parse_post_detail_html
@@ -199,6 +204,33 @@ class InstagramGraphqlScraper:
                         self.logger.warning("Post detail enrichment disabled for remaining posts")
                         break
             merge_post_detail(post, cache[shortcode])
+
+    async def enrich_posts_async(
+        self,
+        posts: list[dict[str, Any]],
+        max_concurrency: int = 10,
+        timeout: float = 30,
+        max_retries: int = 2,
+    ) -> list[dict[str, Any]]:
+        async with InstagramEmbedClient(max_concurrency, timeout, max_retries) as client:
+            details = await client.fetch_many(posts)
+        details_by_shortcode = {
+            detail.get("shortcode"): detail
+            for detail in details
+            if detail.get("shortcode")
+        }
+        for post in posts:
+            detail = details_by_shortcode.get(post.get("shortcode"))
+            if not detail or detail.get("error"):
+                continue
+            for field in (
+                "like_count", "comment_count", "video_view_count",
+                "video_duration", "video_url", "display_uri",
+                "product_type", "media_type", "is_video",
+            ):
+                if post.get(field) is None and detail.get(field) is not None:
+                    post[field] = detail[field]
+        return posts
 
     def _get_detail_response(self, url: str, retries: int = 3) -> requests.Response:
         last_error: requests.RequestException | None = None

@@ -26,6 +26,26 @@ The browser flow opens the profile, dismisses an optional login dialog, scrolls 
 
 `days_limit` is accepted for API compatibility but is not applied when the response has no reliable numeric timestamp. Use `max_pages` or `max_posts` for bounded collection.
 
+For bounded asynchronous Embed enrichment:
+
+```python
+import asyncio
+from instagram_graphql_scraper import InstagramEmbedClient
+
+async def enrich(posts):
+    async with InstagramEmbedClient(max_concurrency=10) as client:
+        return await client.fetch_many(posts)
+
+details = asyncio.run(enrich(posts))
+```
+
+The batch client preserves input order, deduplicates shortcodes per run, and returns a per-post error result instead of failing the whole batch. The single-post normalized CLI remains available:
+
+```bash
+python3 instagram_context_json.py "https://www.instagram.com/p/SHORTCODE/embed/captioned/"
+python3 instagram_context_json.py "https://www.instagram.com/p/SHORTCODE/embed/captioned/" --full
+```
+
 ## Tests
 
 ```bash

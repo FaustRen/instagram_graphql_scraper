@@ -23,6 +23,7 @@ setup(
         "selenium-wire>=5.1",
         "requests>=2.31",
         "brotli>=1.1",
+        "httpx>=0.27",
     ],
     python_requires=">=3.10",
 )

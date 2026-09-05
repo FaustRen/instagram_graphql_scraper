@@ -1,5 +1,6 @@
 import gzip
 import json
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,9 @@ from graphql import (
 from models import CapturedRequest
 from scraper import InstagramGraphqlScraper
 from detail import merge_post_detail, parse_post_detail_html
+from embed import InstagramEmbedClient
+from instagram_context_json import extract_context_json, normalize_media
+import httpx
 
 
 OPERATION = "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery_connection"
@@ -205,3 +209,112 @@ def test_detail_merge_does_not_overwrite_existing_exact_values():
     post = {"like_count": 10, "comment_count": None, "published_at": "2026-07-05"}
     merge_post_detail(post, {"like_count": 20, "comment_count": 4, "published_at": "2026-07-05T12:34:56+00:00"})
     assert post == {"like_count": 10, "comment_count": 4, "published_at": "2026-07-05"}
+
+
+def _embed_html(shortcode, typename="GraphVideo"):
+    media = {
+        "__typename": typename,
+        "id": f"media-{shortcode}",
+        "shortcode": shortcode,
+        "edge_media_to_caption": {"edges": [{"node": {"text": "caption"}}]},
+        "edge_liked_by": {"count": 12},
+        "edge_media_to_comment": {"count": 3},
+        "video_view_count": 99,
+        "video_duration": 4.5,
+        "display_url": "https://example.com/image.jpg",
+        "video_url": "https://example.com/video.mp4",
+        "product_type": "clips",
+        "owner": {"id": "owner-1", "username": "demo"},
+    }
+    context = {"gql_data": {"shortcode_media": media}}
+    return '"contextJSON":' + json.dumps(json.dumps(context))
+
+
+def test_normalize_media_handles_video_image_and_carousel():
+    raw = extract_context_json(_embed_html("v"))["gql_data"]["shortcode_media"]
+    video = normalize_media(raw)
+    image = normalize_media(dict(raw, __typename="GraphImage"))
+    carousel = normalize_media(dict(raw, __typename="GraphSidecar"))
+    assert video["media_type"] == "video"
+    assert video["video_view_count"] == 99
+    assert image["media_type"] == "image"
+    assert image["video_url"] is None
+    assert carousel["media_type"] == "carousel"
+
+
+def test_normalize_media_missing_metrics_and_video_fields_are_none():
+    result = normalize_media({"__typename": "GraphImage", "id": "1", "shortcode": "x"})
+    assert result["like_count"] is None
+    assert result["comment_count"] is None
+    assert result["video_view_count"] is None
+    assert result["video_duration"] is None
+    assert result["video_url"] is None
+
+
+def test_async_embed_batch_preserves_order_deduplicates_and_bounds_concurrency():
+    active = 0
+    peak = 0
+    calls = []
+
+    async def handler(request):
+        nonlocal active, peak
+        shortcode = request.url.path.split("/")[2]
+        calls.append(shortcode)
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.001)
+        active -= 1
+        return httpx.Response(200, text=_embed_html(shortcode), request=request)
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            async with InstagramEmbedClient(max_concurrency=2, client=http_client) as client:
+                return await client.fetch_many(["a", "b", "a", "c"])
+
+    results = asyncio.run(run())
+    assert [item["shortcode"] for item in results] == ["a", "b", "a", "c"]
+    assert calls == ["a", "b", "c"]
+    assert peak <= 2
+
+
+def test_async_embed_batch_failure_is_soft_and_keeps_order():
+    async def handler(request):
+        if request.url.path.split("/")[2] == "bad":
+            return httpx.Response(404, request=request)
+        return httpx.Response(200, text=_embed_html("good"), request=request)
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            async with InstagramEmbedClient(max_concurrency=2, max_retries=1, client=http_client) as client:
+                return await client.fetch_many(["good", "bad"])
+
+    results = asyncio.run(run())
+    assert results[0]["like_count"] == 12
+    assert results[1]["shortcode"] == "bad"
+    assert "error" in results[1]
+
+
+def test_async_embed_retries_503_but_not_404():
+    attempts = {"temporary": 0, "missing": 0}
+
+    async def handler(request):
+        shortcode = request.url.path.split("/")[2]
+        attempts[shortcode] += 1
+        if shortcode == "temporary" and attempts[shortcode] == 1:
+            return httpx.Response(503, request=request)
+        if shortcode == "missing":
+            return httpx.Response(404, request=request)
+        return httpx.Response(200, text=_embed_html(shortcode), request=request)
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            async with InstagramEmbedClient(max_retries=1, client=http_client) as client:
+                return await client.fetch_many(["temporary", "missing"])
+
+    results = asyncio.run(run())
+    assert results[0]["like_count"] == 12
+    assert results[1]["error"] == "HTTP 404"
+    assert attempts == {"temporary": 2, "missing": 1}

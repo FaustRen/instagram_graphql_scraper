@@ -58,6 +58,39 @@ def get_caption(media: dict[str, Any]) -> str | None:
     return None
 
 
+def normalize_media(media: dict[str, Any]) -> dict[str, Any]:
+    """Convert shortcode_media into the stable single-post result schema."""
+    typename = media.get("__typename")
+    media_type_map = {
+        "GraphImage": "image",
+        "GraphVideo": "video",
+        "GraphSidecar": "carousel",
+    }
+    media_type = media_type_map.get(typename) if isinstance(typename, str) else None
+    owner_value = media.get("owner")
+    owner: dict[str, Any] = owner_value if isinstance(owner_value, dict) else {}
+    is_video = media_type == "video"
+    liked_by = media.get("edge_liked_by")
+    comments = media.get("edge_media_to_comment")
+    return {
+        "post_id": media.get("id"),
+        "shortcode": media.get("shortcode"),
+        "post_url": f"https://www.instagram.com/p/{media.get('shortcode')}/" if media.get("shortcode") else None,
+        "caption": get_caption(media),
+        "media_type": media_type,
+        "product_type": media.get("product_type"),
+        "is_video": is_video,
+        "like_count": liked_by.get("count") if isinstance(liked_by, dict) else None,
+        "comment_count": comments.get("count") if isinstance(comments, dict) else None,
+        "video_view_count": media.get("video_view_count") if is_video else None,
+        "video_duration": media.get("video_duration") if is_video else None,
+        "display_uri": media.get("display_url"),
+        "video_url": media.get("video_url") if is_video else None,
+        "username": owner.get("username"),
+        "user_pk": owner.get("id"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("url", help="Instagram /embed/ or /embed/captioned/ URL")
@@ -76,20 +109,7 @@ def main() -> None:
 
     media = get_media(context_json)
     owner = media.get("owner") if isinstance(media.get("owner"), dict) else {}
-    summary = {
-        "type": media.get("__typename"),
-        "id": media.get("id"),
-        "shortcode": media.get("shortcode"),
-        "is_video": media.get("is_video"),
-        "caption": get_caption(media),
-        "owner": {
-            "id": owner.get("id"),
-            "username": owner.get("username"),
-            "is_verified": owner.get("is_verified"),
-        },
-        "display_url": media.get("display_url"),
-        "video_url": media.get("video_url"),
-    }
+    summary = normalize_media(media)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
