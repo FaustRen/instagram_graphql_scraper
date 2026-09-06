@@ -1,0 +1,142 @@
+classDiagram
+    direction TB
+
+    %% ── 協調層 ──────────────────────────────────────────
+    class InstagramGraphqlScraper {
+        +str|None driver_path
+        +bool open_browser
+        +Any driver
+        +str|None ig_account
+        +str|None ig_pwd
+        +bool enrich_details
+        +Session session
+        +CapturedRequest|None captured_request
+        -bool _owns_driver
+        +__init__(driver_path, open_browser, driver, ig_account, ig_pwd, logger, enrich_details)
+        +capture_first_page(username: str, timeout: int) CapturedRequest
+        +get_user_posts(ig_username_or_userid: str, days_limit: int|None, display_progress: bool, max_pages: int|None, max_posts: int|None) list~dict~
+        +enrich_posts(posts: list~dict~) None
+        +enrich_posts_async(posts: list~dict~, max_concurrency: int, timeout: float, max_retries: int) list~dict~
+        +close() None
+        -_build_driver() Any
+        -_prepare_browser(username: str) None
+        -_request_next_page(cursor: str, retries: int) dict
+        -_filter_posts_by_days(posts, cutoff_date)$ tuple
+        -_get_detail_response(url: str, retries: int) Response
+    }
+    note for InstagramGraphqlScraper "quit is an alias of close()\nenrich_posts runs automatically inside get_user_posts\nonly when enrich_details is True\nenrich_posts_async is never called automatically;\nthe caller must await it after get_user_posts returns"
+
+    %% ── 資料模型 ────────────────────────────────────────
+    class CapturedRequest {
+        <<dataclass, models.py>>
+        +str url
+        +str|None operation_name
+        +dict raw_headers
+        +dict replay_headers
+        +dict cookies
+        +dict form_payload
+        +dict variables
+        +str|None doc_id
+        +dict first_response
+        +str|None end_cursor
+        +bool has_next_page
+    }
+
+    %% ── 瀏覽器層 ────────────────────────────────────────
+    class BasePage {
+        <<base/base.py>>
+        +WebDriver driver
+        +__init__(driver_path: str|None, open_browser: bool)
+        -_build_options(open_browser: bool)$ ChromeOptions
+    }
+    note for BasePage "Owns one Selenium Wire Chrome WebDriver.\nCreated lazily by InstagramGraphqlScraper._build_driver()\nonly when no driver was injected."
+
+    class PageOptional {
+        <<pages/page_optional.py>>
+        +Any driver
+        +str|None ig_account
+        +str|None ig_pwd
+        +PageLocators locator
+        +PageText page_text
+        +__init__(driver, ig_account, ig_pwd, logger)
+        +open_profile(username: str) None
+        +close_login_prompt() bool
+        +click_display_button(username: str) None
+        +scroll_window() None
+        +clear_requests() None
+        +login_page() None
+        +login_account(user: str, password: str) None
+    }
+    note for PageOptional "Created fresh inside _prepare_browser() each call;\nnot held as a long-lived attribute.\nOther utility methods (zoom, move_to_element,\nload_next_page, quit_driver, ...) omitted for brevity."
+
+    class PageLocators {
+        <<utils/locator.py>>
+        +tuple LOGIN_DIALOG_CLOSE
+        +tuple LOGIN_CLOSE_FALLBACK
+        +tuple SHOW_MORE_PROFILE_POSTS
+    }
+    class PageText {
+        <<utils/locator.py>>
+        +str SHOW_MORE_PROFILE_POSTS_PREFIX
+        +str SHOW_MORE_PROFILE_POSTS_SUFFIX
+        +str SHOW_MORE_POSTS_ENGLISH
+    }
+    note for PageLocators "Class-level constants only.\nPageOptional stores the class itself\n(self.locator = PageLocators), never an instance."
+
+    %% ── 非同步補資料層 ───────────────────────────────────
+    class InstagramEmbedClient {
+        <<embed.py>>
+        +int max_concurrency
+        +float timeout
+        +int max_retries
+        -AsyncClient|None _client
+        -bool _owns_client
+        -Semaphore _semaphore
+        -dict~str,Task~ _tasks
+        +__init__(max_concurrency: int, timeout: float, max_retries: int, client: AsyncClient|None)
+        +embed_url(shortcode: str, media_type)$ str
+        +fetch_post(shortcode: str, media_type) dict
+        +fetch_many(posts) list~dict~
+        +aclose() None
+        -_ensure_client() AsyncClient
+        -_fetch_post_once(shortcode: str, media_type) dict
+    }
+    note for InstagramEmbedClient "_tasks dedups in-flight requests for the same\nshortcode, scoped to this single instance only.\nA new instance is created per enrich_posts_async()\ncall; the caller may also construct one directly."
+
+    %% ── 詳細頁面解析（HTML）──────────────────────────────
+    class PostDetailParser {
+        <<detail.py>>
+        +dict meta
+        +list times
+        +dict exact_counts
+        -str|None _count_anchor
+        -list _count_text
+        +handle_starttag(tag, attrs) None
+        +handle_data(data) None
+        +handle_endtag(tag) None
+    }
+    note for PostDetailParser "Instantiated per call inside\ndetail.parse_post_detail_html(); never held elsewhere."
+
+    %% ── 外部函式庫依賴 ───────────────────────────────────
+    class Session {
+        <<requests.Session, external>>
+    }
+    class AsyncClient {
+        <<httpx.AsyncClient, external>>
+    }
+    class HTMLParser {
+        <<html.parser.HTMLParser, stdlib>>
+    }
+
+    %% ── 關係 ────────────────────────────────────────────
+    InstagramGraphqlScraper *-- Session : creates and holds in __init__
+    InstagramGraphqlScraper --> CapturedRequest : creates and holds after capture_first_page()
+    InstagramGraphqlScraper ..> BasePage : creates lazily only if driver not injected
+    InstagramGraphqlScraper ..> PageOptional : creates a new instance per _prepare_browser() call
+    InstagramGraphqlScraper ..> InstagramEmbedClient : creates a new instance per enrich_posts_async() call
+    PageOptional ..> PageLocators : reads class-level constants
+    PageOptional ..> PageText : reads class-level constants
+    InstagramEmbedClient o-- AsyncClient : owns unless one is injected via client=
+    HTMLParser <|-- PostDetailParser : inherits
+
+    note "graphql.py, detail.py, instagram_context_json.py, and\nembed.py also expose module-level functions\n(capture_request, parse_connection, normalize_edge,\nparse_accessibility_date, merge_post_detail,\nextract_context_json, normalize_media, normalize_embed_html).\nThese are plain functions, not classes, and are\nintentionally not modeled as class nodes here."
