@@ -1,18 +1,23 @@
+"""Semantic Selenium locators for Instagram controls."""
+
 # -*- coding: utf-8 -*-
 from selenium.webdriver.common.by import By
 
 
 class PageText(object):
+    """Localized text fragments used by page locators."""
     SHOW_MORE_PROFILE_POSTS_PREFIX = "顯示更多"
     SHOW_MORE_PROFILE_POSTS_SUFFIX = "的貼文"
     SHOW_MORE_POSTS_ENGLISH = "Show more posts"
 
 
 class PageRoleValue(object):
+    """ARIA role values used by page locators."""
     BUTTON = "button"
 
 
 class PageLocators(object):
+    """Stable semantic Selenium locators for Instagram page controls."""
     LOGIN_DIALOG = (By.XPATH, "//div[@role='dialog']")
     LOGIN_DIALOG_CLOSE = (
         By.XPATH,

@@ -1,3 +1,5 @@
+"""Instagram timeline GraphQL request, response, and normalization helpers."""
+
 import gzip
 import json
 import logging
@@ -23,19 +25,31 @@ TRANSPORT_HEADERS = {
 
 
 class InstagramGraphQLError(ValueError):
+    """Raised when an Instagram GraphQL request or response is invalid."""
+
     pass
 
 
 def _headers(request: Any) -> dict[str, str]:
+    """Copy request headers into a regular string dictionary."""
     return {str(key): str(value) for key, value in getattr(request, "headers", {}).items()}
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
+    """Find a header case-insensitively."""
     name = name.lower()
     return next((value for key, value in headers.items() if key.lower() == name), None)
 
 
 def parse_form_payload(body: bytes | str | None) -> tuple[dict[str, str], dict[str, Any]]:
+    """Decode form-urlencoded request data and its JSON variables.
+
+    Args:
+        body: Raw request body as bytes or text.
+
+    Returns:
+        Complete form payload and decoded variables dictionary.
+    """
     if body is None:
         raise InstagramGraphQLError("GraphQL request has an empty body")
     text = body.decode("utf-8") if isinstance(body, bytes) else body
@@ -54,6 +68,7 @@ def parse_form_payload(body: bytes | str | None) -> tuple[dict[str, str], dict[s
 
 
 def decode_response_body(body: bytes | str | None, encoding: str | None) -> dict[str, Any]:
+    """Decode compressed response bytes and parse the JSON object."""
     if not body:
         raise InstagramGraphQLError("GraphQL response body is empty")
     raw = body.encode("utf-8") if isinstance(body, str) else body
@@ -82,7 +97,7 @@ def decode_response_body(body: bytes | str | None, encoding: str | None) -> dict
 
 
 def request_debug_summary(requests: Any) -> str:
-    """Return request diagnostics without exposing headers, cookies, or bodies."""
+    """Return safe request diagnostics without exposing secrets or bodies."""
     summaries = []
     for request in requests:
         parsed_url = urlparse(str(getattr(request, "url", "")))
@@ -104,6 +119,7 @@ def request_debug_summary(requests: Any) -> str:
 
 
 def _connection(response_json: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the profile timeline connection from a GraphQL response."""
     try:
         connection = response_json["data"]["node"]["polaris_ordered_timeline_connection"]
         edges = connection["edges"]
@@ -118,6 +134,7 @@ def _connection(response_json: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def parse_connection(response_json: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Parse timeline edges and return posts, end cursor, and next-page state."""
     connection = _connection(response_json)
     posts = [normalize_edge(edge) for edge in connection["edges"]]
     page_info = connection["page_info"]
@@ -125,6 +142,7 @@ def parse_connection(response_json: Mapping[str, Any]) -> tuple[list[dict[str, A
 
 
 def normalize_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one timeline edge into the public post schema."""
     node = edge.get("node") if isinstance(edge, Mapping) else None
     if not isinstance(node, Mapping):
         raise InstagramGraphQLError("Instagram timeline edge has no node")
@@ -168,7 +186,27 @@ def normalize_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def parse_accessibility_date(value: str | None):
+    """Parse a date from Instagram's Photo/Video accessibility caption."""
+    if not isinstance(value, str):
+        return None
+    match = re.search(
+        r"\b(?:Photo|Video) by .*? on "
+        r"(January|February|March|April|May|June|July|August|September|October|November|December) "
+        r"(\d{1,2}), (\d{4})\b",
+        value,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        return datetime.strptime(" ".join(match.groups()), "%B %d %Y").date()
+    except ValueError:
+        return None
+
+
 def _first_value(value: Mapping[str, Any], *keys: str) -> Any:
+    """Return the first non-null value found under the supplied keys."""
     for key in keys:
         if key in value and value[key] is not None:
             return value[key]
@@ -176,6 +214,7 @@ def _first_value(value: Mapping[str, Any], *keys: str) -> Any:
 
 
 def _count_value(node: Mapping[str, Any], *keys: str) -> Any:
+    """Find a direct or nested metric count in a media node."""
     value = _first_value(node, *keys)
     if value is None:
         value = _find_nested_value(node, set(keys))
@@ -185,6 +224,7 @@ def _count_value(node: Mapping[str, Any], *keys: str) -> Any:
 
 
 def _find_nested_value(value: Any, keys: set[str]) -> Any:
+    """Recursively find the first non-null value for any target key."""
     if isinstance(value, Mapping):
         for key, child in value.items():
             if key in keys and child is not None:
@@ -201,6 +241,7 @@ def _find_nested_value(value: Any, keys: set[str]) -> Any:
 
 
 def replay_headers(raw_headers: Mapping[str, str], cookies: Mapping[str, str]) -> dict[str, str]:
+    """Build headers safe for replaying a captured GraphQL request."""
     csrf = cookies.get("csrftoken")
     result = {}
     for key, value in raw_headers.items():
@@ -214,6 +255,7 @@ def replay_headers(raw_headers: Mapping[str, str], cookies: Mapping[str, str]) -
 
 
 def redact_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Redact cookies, tokens, and authorization values from headers."""
     return {
         key: "<redacted>" if key.lower() in SENSITIVE_HEADERS or re.search("token|cookie|authorization", key, re.I) else value
         for key, value in headers.items()
@@ -221,6 +263,7 @@ def redact_headers(headers: Mapping[str, str]) -> dict[str, str]:
 
 
 def is_target_graphql_request(request: Any, logger: logging.Logger | None = None) -> bool:
+    """Check whether a Selenium Wire request is the profile timeline query."""
     headers = _headers(request)
     parsed_url = urlparse(str(getattr(request, "url", "")))
     if str(getattr(request, "method", "")).upper() != "POST" or parsed_url.path != GRAPHQL_PATH:
@@ -243,6 +286,7 @@ def is_target_graphql_request(request: Any, logger: logging.Logger | None = None
 
 
 def capture_request(request: Any, cookies: Mapping[str, str]) -> CapturedRequest:
+    """Capture a validated browser GraphQL request and its first response."""
     if not is_target_graphql_request(request):
         raise InstagramGraphQLError("Request does not match the Instagram profile posts GraphQL request")
     raw_headers = _headers(request)
@@ -267,6 +311,7 @@ def capture_request(request: Any, cookies: Mapping[str, str]) -> CapturedRequest
 
 
 def next_payload(captured: CapturedRequest, cursor: str) -> dict[str, str]:
+    """Create the next-page payload by replacing only the after cursor."""
     payload = dict(captured.form_payload)
     variables = dict(captured.variables)
     variables["after"] = cursor
@@ -275,4 +320,5 @@ def next_payload(captured: CapturedRequest, cursor: str) -> dict[str, str]:
 
 
 def log_capture(logger: logging.Logger, captured: CapturedRequest) -> None:
+    """Log safe metadata for a captured request."""
     logger.debug("Captured Instagram GraphQL request operation=%s doc_id=%s headers=%s", captured.operation_name, captured.doc_id, redact_headers(captured.raw_headers))

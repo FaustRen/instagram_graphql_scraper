@@ -1,3 +1,5 @@
+"""Instagram page interaction helpers."""
+
 # -*- coding: utf-8 -*-
 from typing import Any, Optional
 
@@ -15,7 +17,17 @@ import logging
 
 
 class PageOptional(object):
+    """Provide Instagram page navigation and optional login interactions."""
+
     def __init__(self, driver: Any = None, ig_account: Optional[str] = None, ig_pwd: Optional[str] = None, logger=None):
+        """Initialize page helpers around a Selenium driver.
+
+        Args:
+            driver: Selenium WebDriver instance.
+            ig_account: Optional Instagram username.
+            ig_pwd: Optional Instagram password.
+            logger: Optional logger for non-fatal browser events.
+        """
         self.locator = PageLocators
         self.page_text = PageText
         self.driver = driver
@@ -30,6 +42,7 @@ class PageOptional(object):
             self.login_page()
 
     def login_page(self):
+        """Submit the optional Instagram login form."""
         try:
             assert self.ig_account is not None
             assert self.ig_pwd is not None
@@ -41,9 +54,11 @@ class PageOptional(object):
             print(f"Login faield, message: {e}")
 
     def open_profile(self, username: str):
+        """Open a public Instagram profile by username."""
         self.driver.get(f"https://www.instagram.com/{username.strip('/')}/")
 
     def clear_requests(self):
+        """Clear Selenium Wire requests collected before the target action."""
         try:
             del self.driver.requests
         except Exception as e:
@@ -52,6 +67,7 @@ class PageOptional(object):
     clean_requests = clear_requests
 
     def login_account(self, user: str, password: str):
+        """Fill and submit Instagram username and password fields."""
         user_element = self.driver.find_element(By.NAME, "username")
         user_element.send_keys(user)
         password_element = self.driver.find_element(By.NAME, "password")
@@ -59,25 +75,31 @@ class PageOptional(object):
         password_element.send_keys(Keys.ENTER)
 
     def scroll_window(self):
+        """Scroll to the bottom of the current page."""
         self.driver.execute_script(
             "window.scrollTo(0,document.body.scrollHeight)")
 
     def scroll_window_with_parameter(self, parameter_in: str):
+        """Scroll by a caller-supplied JavaScript distance."""
         self.driver.execute_script(f"window.scrollBy(0, {parameter_in});")
 
     def set_browser_zoom_percent(self, zoom_percent: int):
+        """Set the document zoom percentage."""
         zoom_value = str(zoom_percent)
         self.driver.execute_script(
             f"document.body.style.zoom='{zoom_value}%'")
 
     def move_to_element(self, element_in):
+        """Move the pointer to a Selenium element."""
         ActionChains(self.driver).move_to_element(element_in).perform()
 
     def load_next_page(self, url: str, clear_limit: int = 20):
+        """Clear captured requests and navigate to a new URL."""
         self.clear_requests()
         self.driver.get(url=url)
 
     def close_login_prompt(self):
+        """Close the optional login dialog using semantic locators."""
         for locator in (self.locator.LOGIN_DIALOG_CLOSE, self.locator.LOGIN_CLOSE_FALLBACK):
             try:
                 button = WebDriverWait(self.driver, 5).until(
@@ -96,6 +118,7 @@ class PageOptional(object):
         return False
 
     def click_display_button(self, username: str = ""):
+        """Click the dynamic show-more-posts button once."""
         button = WebDriverWait(self.driver, 15).until(
             EC.element_to_be_clickable(self.locator.SHOW_MORE_PROFILE_POSTS)
         )
@@ -108,9 +131,11 @@ class PageOptional(object):
             self.driver.execute_script("arguments[0].click();", button)
 
     def click_display_button2(self):
+        """Compatibility alias for clicking the show-more button."""
         return self.click_display_button()
 
     def click_reject_login_button(self):
+        """Compatibility wrapper for dismissing a login prompt."""
         try:
             self.close_login_prompt()
         except Exception as e:
@@ -118,7 +143,9 @@ class PageOptional(object):
             print(f"Click reject button skipped, message: {short_message}")
 
     def quit_driver(self):
+        """Quit the Selenium driver."""
         self.driver.quit()
 
     def close_driver(self):
+        """Close the current Selenium window."""
         self.driver.close()

@@ -1,3 +1,5 @@
+"""Single-post Instagram Embed context extraction and CLI utilities."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,7 +14,17 @@ CONTEXT_JSON_KEY = re.compile(r'"contextJSON"\s*:\s*')
 
 
 def extract_context_json(html: str) -> dict[str, Any]:
-    """Extract and decode Instagram's string-encoded contextJSON object."""
+    """Extract and decode Instagram's string-encoded contextJSON object.
+
+    Args:
+        html: Instagram Embed HTML response.
+
+    Returns:
+        Decoded context JSON dictionary.
+
+    Raises:
+        ValueError: If no valid contextJSON object can be decoded.
+    """
     decoder = json.JSONDecoder()
 
     for match in CONTEXT_JSON_KEY.finditer(html):
@@ -36,6 +48,15 @@ def extract_context_json(html: str) -> dict[str, Any]:
 
 
 def fetch_context_json(url: str, timeout: float = 30) -> dict[str, Any]:
+    """Fetch one Embed page and decode its context JSON.
+
+    Args:
+        url: Instagram Embed URL.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        Decoded context JSON dictionary.
+    """
     # The tested response worked with requests' default User-Agent.
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
@@ -43,6 +64,7 @@ def fetch_context_json(url: str, timeout: float = 30) -> dict[str, Any]:
 
 
 def get_media(context_json: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``gql_data.shortcode_media`` object from context JSON."""
     media = context_json.get("gql_data", {}).get("shortcode_media")
     if not isinstance(media, dict):
         raise KeyError("contextJSON 中找不到 gql_data.shortcode_media")
@@ -50,6 +72,7 @@ def get_media(context_json: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_caption(media: dict[str, Any]) -> str | None:
+    """Extract the first caption text from a media object."""
     edges = media.get("edge_media_to_caption", {}).get("edges", [])
     for edge in edges:
         text = edge.get("node", {}).get("text")
@@ -59,7 +82,14 @@ def get_caption(media: dict[str, Any]) -> str | None:
 
 
 def normalize_media(media: dict[str, Any]) -> dict[str, Any]:
-    """Convert shortcode_media into the stable single-post result schema."""
+    """Convert shortcode_media into the stable single-post result schema.
+
+    Args:
+        media: Decoded ``gql_data.shortcode_media`` dictionary.
+
+    Returns:
+        Normalized image, video, or carousel post metadata.
+    """
     typename = media.get("__typename")
     media_type_map = {
         "GraphImage": "image",
@@ -93,6 +123,7 @@ def normalize_media(media: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
+    """Run the single-post normalized or raw context CLI."""
     parser = argparse.ArgumentParser()
     parser.add_argument("url", help="Instagram /embed/ or /embed/captioned/ URL")
     parser.add_argument(

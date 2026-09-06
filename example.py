@@ -1,3 +1,5 @@
+"""Basic Instagram scraper usage examples."""
+
 # -*- coding: utf-8 -*-
 if __package__:
     from . import InstagramGraphqlScraper as ig_graphql_scraper

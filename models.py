@@ -1,9 +1,13 @@
+"""Data models shared by the Instagram scraper pipeline."""
+
 from dataclasses import dataclass
 from typing import Any
 
 
 @dataclass
 class CapturedRequest:
+    """Store a browser-captured GraphQL request and its first response."""
+
     url: str
     operation_name: str | None
     raw_headers: dict[str, str]

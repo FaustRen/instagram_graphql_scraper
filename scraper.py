@@ -1,5 +1,8 @@
+"""Public Instagram timeline scraper and detail enrichment orchestration."""
+
 import logging
 import time
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -22,6 +25,7 @@ try:
         log_capture,
         next_payload,
         parse_connection,
+        parse_accessibility_date,
         request_debug_summary,
     )
     from .models import CapturedRequest
@@ -33,12 +37,14 @@ except ImportError:
         log_capture,
         next_payload,
         parse_connection,
+        parse_accessibility_date,
         request_debug_summary,
     )
     from models import CapturedRequest
 
 
 class InstagramGraphqlScraper:
+    """Scrape Instagram profile timelines and enrich posts from Embed pages."""
     def __init__(
         self,
         driver_path: str | None = None,
@@ -49,6 +55,17 @@ class InstagramGraphqlScraper:
         logger: logging.Logger | None = None,
         enrich_details: bool = True,
     ):
+        """Initialize browser, session, and enrichment settings.
+
+        Args:
+            driver_path: Optional ChromeDriver executable path.
+            open_browser: Whether to run Chrome visibly.
+            driver: Optional externally managed Selenium driver.
+            ig_account: Optional Instagram login username.
+            ig_pwd: Optional Instagram login password.
+            logger: Optional logger instance.
+            enrich_details: Whether sync Embed enrichment runs automatically.
+        """
         self.logger = logger or logging.getLogger(__name__)
         self._owns_driver = driver is None
         self.driver = driver
@@ -61,6 +78,7 @@ class InstagramGraphqlScraper:
         self.enrich_details = enrich_details
 
     def _build_driver(self) -> Any:
+        """Create the Selenium Wire driver when one was not supplied."""
         if self.driver is not None:
             return self.driver
         try:
@@ -71,6 +89,7 @@ class InstagramGraphqlScraper:
         return self.driver
 
     def _prepare_browser(self, username: str) -> None:
+        """Open a profile and trigger the browser timeline request."""
         try:
             from .pages.page_optional import PageOptional
         except ImportError:
@@ -83,6 +102,7 @@ class InstagramGraphqlScraper:
         page.click_display_button(username)
 
     def capture_first_page(self, username: str, timeout: int = 20) -> CapturedRequest:
+        """Capture and store the first profile timeline GraphQL response."""
         driver = self._build_driver()
         self._prepare_browser(username)
         from selenium.webdriver.support.ui import WebDriverWait
@@ -106,6 +126,7 @@ class InstagramGraphqlScraper:
         return self.captured_request
 
     def _request_next_page(self, cursor: str, retries: int = 3) -> dict[str, Any]:
+        """Replay one timeline page using the captured request template."""
         if self.captured_request is None:
             raise InstagramGraphQLError("First GraphQL response must be captured before pagination")
         payload = next_payload(self.captured_request, cursor)
@@ -140,15 +161,35 @@ class InstagramGraphqlScraper:
         max_pages: int | None = None,
         max_posts: int | None = None,
     ) -> list[dict[str, Any]]:
-        del days_limit
+        """Collect, paginate, deduplicate, and optionally enrich profile posts.
+
+        Args:
+            ig_username_or_userid: Public Instagram username or compatible ID.
+            days_limit: Keep posts newer than this many days when dates are known.
+            display_progress: Print collection progress after each page.
+            max_pages: Optional maximum number of timeline pages.
+            max_posts: Optional maximum number of returned posts.
+
+        Returns:
+            Posts in timeline order.
+        """
         username = str(ig_username_or_userid).strip()
         if not username:
             raise ValueError("ig_username_or_userid must not be empty")
+        if days_limit is not None and days_limit < 0:
+            raise ValueError("days_limit must be non-negative")
+        cutoff_date = (
+            datetime.now(timezone.utc).date() - timedelta(days=days_limit)
+            if days_limit is not None else None
+        )
         captured = self.capture_first_page(username)
         posts, cursor, has_next = parse_connection(captured.first_response)
         seen_posts = {post.get("post_id") or post.get("graphql_id") or post.get("shortcode") for post in posts}
         seen_cursors = {cursor} if cursor else set()
         page_count = 1
+        posts, reached_cutoff = self._filter_posts_by_days(posts, cutoff_date)
+        if reached_cutoff:
+            has_next = False
         while has_next and cursor and (max_pages is None or page_count < max_pages):
             if cursor in seen_cursors - {cursor}:
                 self.logger.warning("Stopping pagination because cursor repeated")
@@ -156,6 +197,7 @@ class InstagramGraphqlScraper:
             seen_cursors.add(cursor)
             response_json = self._request_next_page(cursor)
             page_posts, next_cursor, has_next = parse_connection(response_json)
+            page_posts, reached_cutoff = self._filter_posts_by_days(page_posts, cutoff_date)
             for post in page_posts:
                 identity = post.get("post_id") or post.get("graphql_id") or post.get("shortcode")
                 if identity not in seen_posts:
@@ -167,6 +209,9 @@ class InstagramGraphqlScraper:
             if max_posts is not None and len(posts) >= max_posts:
                 posts = posts[:max_posts]
                 break
+            if reached_cutoff:
+                self.logger.info("Stopping pagination at days_limit=%s", days_limit)
+                break
             if not next_cursor or next_cursor in seen_cursors:
                 self.logger.warning("Stopping pagination because end_cursor repeated or is empty")
                 break
@@ -176,7 +221,25 @@ class InstagramGraphqlScraper:
             self.enrich_posts(posts)
         return posts
 
+    @staticmethod
+    def _filter_posts_by_days(
+        posts: list[dict[str, Any]], cutoff_date: date | None
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Filter old dated posts and report whether the cutoff was reached."""
+        if cutoff_date is None:
+            return posts, False
+        filtered = []
+        reached_cutoff = False
+        for post in posts:
+            post_date = parse_accessibility_date(post.get("accessibility_caption"))
+            if post_date is not None and post_date < cutoff_date:
+                reached_cutoff = True
+                continue
+            filtered.append(post)
+        return filtered, reached_cutoff
+
     def enrich_posts(self, posts: list[dict[str, Any]]) -> None:
+        """Synchronously enrich posts while preserving fail-soft behavior."""
         cache: dict[str, dict[str, Any]] = {}
         consecutive_failures = 0
         for post in posts:
@@ -212,6 +275,17 @@ class InstagramGraphqlScraper:
         timeout: float = 30,
         max_retries: int = 2,
     ) -> list[dict[str, Any]]:
+        """Asynchronously enrich posts with bounded Embed concurrency.
+
+        Args:
+            posts: Existing normalized timeline posts.
+            max_concurrency: Maximum simultaneous Embed requests.
+            timeout: Per-request timeout in seconds.
+            max_retries: Number of transient retries.
+
+        Returns:
+            The same posts list with available detail fields merged in order.
+        """
         async with InstagramEmbedClient(max_concurrency, timeout, max_retries) as client:
             details = await client.fetch_many(posts)
         details_by_shortcode = {
@@ -227,6 +301,7 @@ class InstagramGraphqlScraper:
         return posts
 
     def _get_detail_response(self, url: str, retries: int = 3) -> requests.Response:
+        """GET one detail page with safe headers and transient retries."""
         last_error: requests.RequestException | None = None
         detail_headers = {
             key: value
@@ -256,6 +331,7 @@ class InstagramGraphqlScraper:
         raise last_error or requests.RequestException("Instagram detail request failed")
 
     def close(self) -> None:
+        """Close the owned browser and requests session."""
         if self.driver is not None and self._owns_driver:
             self.driver.quit()
         self.session.close()

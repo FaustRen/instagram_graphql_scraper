@@ -1,3 +1,5 @@
+"""Manual browser integration entry point for public Instagram profiles."""
+
 import argparse
 import json
 

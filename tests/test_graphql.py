@@ -1,3 +1,5 @@
+"""Sanitized unit tests for GraphQL parsing and Embed enrichment."""
+
 import gzip
 import json
 import asyncio
@@ -14,6 +16,7 @@ from graphql import (
     parse_connection,
     parse_form_payload,
     redact_headers,
+    parse_accessibility_date,
 )
 from models import CapturedRequest
 from scraper import InstagramGraphqlScraper
@@ -27,6 +30,7 @@ OPERATION = "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery_connection"
 
 
 def make_response(posts=None, end_cursor="cursor-2", has_next_page=True, status_code=200, encoding=None):
+    """Build a sanitized timeline response fixture."""
     posts = posts or [
         {"pk": "1", "id": "POLARIS_1", "code": "image1", "media_type": 1, "user": {"pk": "u1", "username": "demo", "id": "U1"}},
         {"pk": "2", "id": "POLARIS_2", "code": "video2", "media_type": 2, "product_type": "clips", "user": {"username": "demo"}},
@@ -39,18 +43,21 @@ def make_response(posts=None, end_cursor="cursor-2", has_next_page=True, status_
 
 
 def make_request(operation=OPERATION, response=None, path="/api/graphql", method="POST"):
+    """Build a sanitized Selenium Wire request fixture."""
     variables = json.dumps({"after": "initial", "first": 12, "id": "user-id"})
     body = f"variables={variables.replace(' ', '')}&doc_id=doc-1&fb_api_req_friendly_name={operation}"
     return SimpleNamespace(method=method, url=f"https://www.instagram.com{path}", body=body.encode(), headers={"X-Fb-Friendly-Name": operation, "Content-Type": "application/x-www-form-urlencoded", "Cookie": "secret"}, response=response or make_response())
 
 
 def test_form_payload_and_variables_are_decoded():
+    """Verify form fields and JSON variables are decoded separately."""
     payload, variables = parse_form_payload(b"variables=%7B%22after%22%3A%22c%22%2C%22first%22%3A12%7D&doc_id=doc")
     assert payload["doc_id"] == "doc"
     assert variables == {"after": "c", "first": 12}
 
 
 def test_matcher_rejects_other_graphql_requests():
+    """Verify the matcher rejects wrong paths, methods, and statuses."""
     assert is_target_graphql_request(make_request(response=make_response(), path="/api/other")) is False
     assert is_target_graphql_request(make_request(operation="OtherOperation")) is True
     assert is_target_graphql_request(make_request(response=make_response(status_code=500))) is False
@@ -58,6 +65,7 @@ def test_matcher_rejects_other_graphql_requests():
 
 
 def test_capture_decodes_response_and_preserves_payload_without_secrets_in_debug_view():
+    """Verify capture preserves request data while redacting debug headers."""
     request = make_request(response=make_response(encoding="gzip"))
     captured = capture_request(request, {"csrftoken": "secret-csrf", "sessionid": "secret-session"})
     assert captured.doc_id == "doc-1"
@@ -67,6 +75,7 @@ def test_capture_decodes_response_and_preserves_payload_without_secrets_in_debug
 
 
 def test_parse_all_media_types_and_optional_fields():
+    """Verify image, video, carousel, and missing optional fields normalize."""
     posts, _, _ = parse_connection(json.loads(make_response().body))
     assert [post["media_type"] for post in posts] == [1, 2, 8]
     assert posts[1]["is_video"] is True
@@ -75,6 +84,7 @@ def test_parse_all_media_types_and_optional_fields():
 
 
 def test_parse_counts_and_timestamp_without_guessing_from_accessibility_caption():
+    """Verify exact metrics and numeric timestamps are parsed without guessing."""
     response = json.loads(make_response(posts=[{
         "pk": "1",
         "id": "POLARIS_1",
@@ -95,6 +105,7 @@ def test_parse_counts_and_timestamp_without_guessing_from_accessibility_caption(
 
 
 def test_parse_nested_metrics_when_timeline_returns_them():
+    """Verify nested metric counts are discovered when present."""
     response = json.loads(make_response(posts=[{
         "pk": "1",
         "id": "POLARIS_1",
@@ -111,6 +122,7 @@ def test_parse_nested_metrics_when_timeline_returns_them():
 
 
 def test_end_cursor_comes_from_page_info():
+    """Verify pagination uses page_info.end_cursor rather than edge cursors."""
     response = json.loads(make_response(end_cursor="page-info-cursor").body)
     _, cursor, _ = parse_connection(response)
     assert cursor == "page-info-cursor"
@@ -118,6 +130,7 @@ def test_end_cursor_comes_from_page_info():
 
 
 def test_next_payload_changes_only_after_cursor():
+    """Verify next-page payload changes only the after cursor."""
     captured = capture_request(make_request(), {"csrftoken": "csrf"})
     payload = next_payload(captured, "next-cursor")
     assert json.loads(payload["variables"])["after"] == "next-cursor"
@@ -125,11 +138,13 @@ def test_next_payload_changes_only_after_cursor():
 
 
 def test_schema_change_has_clear_error():
+    """Verify missing timeline schema raises a readable error."""
     with pytest.raises(InstagramGraphQLError, match="polaris_ordered_timeline_connection"):
         parse_connection({"data": {"node": {}}})
 
 
 def test_first_capture_is_not_replayed_and_duplicate_posts_are_removed():
+    """Verify the first page is retained and duplicate posts are removed."""
     scraper = InstagramGraphqlScraper(driver=object())
     first = capture_request(make_request(), {"csrftoken": "csrf"})
     scraper.capture_first_page = lambda username: first
@@ -139,6 +154,7 @@ def test_first_capture_is_not_replayed_and_duplicate_posts_are_removed():
 
 
 def test_repeated_cursor_stops_pagination():
+    """Verify repeated cursors stop pagination."""
     scraper = InstagramGraphqlScraper(driver=object())
     first = capture_request(make_request(response=make_response(end_cursor="same", has_next_page=True)), {"csrftoken": "csrf"})
     scraper.capture_first_page = lambda username: first
@@ -149,11 +165,36 @@ def test_repeated_cursor_stops_pagination():
 
 
 def test_empty_response_is_rejected():
+    """Verify empty GraphQL responses are rejected."""
     with pytest.raises(InstagramGraphQLError, match="empty"):
         decode_response_body(b"", "identity")
 
 
+def test_accessibility_caption_date_is_parsed_for_days_limit():
+    """Verify Photo and Video accessibility dates are parsed."""
+    assert parse_accessibility_date("Photo by demo on July 12, 2026.").isoformat() == "2026-07-12"
+    assert parse_accessibility_date("Video by demo on June 16, 2026.").isoformat() == "2026-06-16"
+    assert parse_accessibility_date("No publication date") is None
+
+
+def test_days_limit_filters_old_posts_and_signals_pagination_stop():
+    """Verify old dated posts are filtered and cutoff is reported."""
+    from datetime import date
+
+    posts = [
+        {"post_id": "new", "accessibility_caption": "Photo by demo on July 12, 2026."},
+        {"post_id": "old", "accessibility_caption": "Photo by demo on June 1, 2026."},
+        {"post_id": "unknown", "accessibility_caption": None},
+    ]
+    filtered, reached_cutoff = InstagramGraphqlScraper._filter_posts_by_days(
+        posts, date(2026, 7, 1)
+    )
+    assert [post["post_id"] for post in filtered] == ["new", "unknown"]
+    assert reached_cutoff is True
+
+
 def test_post_detail_html_parses_exact_counts_and_timestamp():
+    """Verify HTML detail exact counts and timestamps are normalized."""
     html = '<meta name="description" content="9,961 likes, 65 comments - demo on July 5, 2026">'
     html += '<time datetime="2026-07-05T12:34:56.000Z">July 5</time>'
     detail = parse_post_detail_html(html, "CODE")
@@ -165,6 +206,7 @@ def test_post_detail_html_parses_exact_counts_and_timestamp():
 
 
 def test_post_detail_html_marks_rounded_counts_and_reads_video_views():
+    """Verify rounded counts are marked approximate and views are parsed."""
     detail = parse_post_detail_html('<meta property="og:description" content="14K likes, 60 comments, 2.5K views">')
     assert detail["like_count"] == 14000
     assert detail["comment_count"] == 60
@@ -173,6 +215,7 @@ def test_post_detail_html_marks_rounded_counts_and_reads_video_views():
 
 
 def test_post_embed_html_prefers_exact_anchor_counts_over_rounded_description():
+    """Verify exact Embed anchor counts override rounded descriptions."""
     html = '<meta name="description" content="14K likes, 60 comments - demo on July 26, 2026">'
     html += '<a data-log-event="likeCountClick">7,320,872 likes</a>'
     html += '<a data-log-event="captionCommentsClick">View all 62,125 comments</a>'
@@ -184,6 +227,7 @@ def test_post_embed_html_prefers_exact_anchor_counts_over_rounded_description():
 
 
 def test_post_embed_html_parses_structured_exact_counts_when_anchor_variant_changes():
+    """Verify structured Embed counts work across HTML anchor variants."""
     html = r'''<script>"edge_media_to_comment":{"count":62125},"edge_liked_by":{"count":7320872}</script>'''
     detail = parse_post_detail_html(html, "CODE")
     assert detail["like_count"] == 7320872
@@ -192,6 +236,7 @@ def test_post_embed_html_parses_structured_exact_counts_when_anchor_variant_chan
 
 
 def test_post_detail_html_missing_fields_are_none():
+    """Verify missing detail fields remain None."""
     detail = parse_post_detail_html("<html><body>No metrics</body></html>")
     assert detail["like_count"] is None
     assert detail["comment_count"] is None
@@ -200,18 +245,21 @@ def test_post_detail_html_missing_fields_are_none():
 
 
 def test_post_detail_html_uses_date_only_fallback_without_fake_timestamp():
+    """Verify date-only fallback does not fabricate a timestamp."""
     detail = parse_post_detail_html('<meta name="description" content="1,797 likes, 13 comments - demo on June 16, 2026">')
     assert detail["published_at"] == "2026-06-16"
     assert detail["taken_at_timestamp"] is None
 
 
 def test_detail_merge_does_not_overwrite_existing_exact_values():
+    """Verify detail merging preserves existing exact post values."""
     post = {"like_count": 10, "comment_count": None, "published_at": "2026-07-05"}
     merge_post_detail(post, {"like_count": 20, "comment_count": 4, "published_at": "2026-07-05T12:34:56+00:00"})
     assert post == {"like_count": 10, "comment_count": 4, "published_at": "2026-07-05"}
 
 
 def _embed_html(shortcode, typename="GraphVideo"):
+    """Build a sanitized contextJSON Embed fixture."""
     media = {
         "__typename": typename,
         "id": f"media-{shortcode}",
@@ -231,6 +279,7 @@ def _embed_html(shortcode, typename="GraphVideo"):
 
 
 def test_normalize_media_handles_video_image_and_carousel():
+    """Verify normalized media types share a stable schema."""
     raw = extract_context_json(_embed_html("v"))["gql_data"]["shortcode_media"]
     video = normalize_media(raw)
     image = normalize_media(dict(raw, __typename="GraphImage"))
@@ -243,6 +292,7 @@ def test_normalize_media_handles_video_image_and_carousel():
 
 
 def test_normalize_media_missing_metrics_and_video_fields_are_none():
+    """Verify missing media metrics and video fields remain None."""
     result = normalize_media({"__typename": "GraphImage", "id": "1", "shortcode": "x"})
     assert result["like_count"] is None
     assert result["comment_count"] is None
@@ -252,11 +302,13 @@ def test_normalize_media_missing_metrics_and_video_fields_are_none():
 
 
 def test_async_embed_batch_preserves_order_deduplicates_and_bounds_concurrency():
+    """Verify async batches preserve order, deduplicate, and bound concurrency."""
     active = 0
     peak = 0
     calls = []
 
     async def handler(request):
+        """Return a delayed sanitized response and track active requests."""
         nonlocal active, peak
         shortcode = request.url.path.split("/")[2]
         calls.append(shortcode)
@@ -267,6 +319,7 @@ def test_async_embed_batch_preserves_order_deduplicates_and_bounds_concurrency()
         return httpx.Response(200, text=_embed_html(shortcode), request=request)
 
     async def run():
+        """Run the bounded async client against a mock transport."""
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as http_client:
             async with InstagramEmbedClient(max_concurrency=2, client=http_client) as client:
@@ -279,12 +332,15 @@ def test_async_embed_batch_preserves_order_deduplicates_and_bounds_concurrency()
 
 
 def test_async_embed_batch_failure_is_soft_and_keeps_order():
+    """Verify one batch failure does not discard successful results."""
     async def handler(request):
+        """Return one synthetic 404 and one successful response."""
         if request.url.path.split("/")[2] == "bad":
             return httpx.Response(404, request=request)
         return httpx.Response(200, text=_embed_html("good"), request=request)
 
     async def run():
+        """Run failure-soft batch behavior against a mock transport."""
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as http_client:
             async with InstagramEmbedClient(max_concurrency=2, max_retries=1, client=http_client) as client:
@@ -297,9 +353,11 @@ def test_async_embed_batch_failure_is_soft_and_keeps_order():
 
 
 def test_async_embed_retries_503_but_not_404():
+    """Verify transient 503 retries while 404 fails immediately."""
     attempts = {"temporary": 0, "missing": 0}
 
     async def handler(request):
+        """Return a transient failure, permanent failure, or success."""
         shortcode = request.url.path.split("/")[2]
         attempts[shortcode] += 1
         if shortcode == "temporary" and attempts[shortcode] == 1:
@@ -309,6 +367,7 @@ def test_async_embed_retries_503_but_not_404():
         return httpx.Response(200, text=_embed_html(shortcode), request=request)
 
     async def run():
+        """Run retry behavior against a mock transport."""
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as http_client:
             async with InstagramEmbedClient(max_retries=1, client=http_client) as client:
@@ -321,6 +380,7 @@ def test_async_embed_retries_503_but_not_404():
 
 
 def test_context_json_null_uses_exact_html_metrics_fallback():
+    """Verify contextJSON null falls back to exact HTML metrics."""
     html = '<script>contextJSON:null</script>'
     html += '<a data-log-event="likeCountClick">42,318 likes</a>'
     html += '<a data-log-event="captionCommentsClick">View all 190 comments</a>'
@@ -332,6 +392,7 @@ def test_context_json_null_uses_exact_html_metrics_fallback():
 
 
 def test_merge_includes_video_detail_fields():
+    """Verify video metrics and URLs are merged into existing posts."""
     post = {"shortcode": "video", "video_view_count": None, "video_duration": None, "video_url": None}
     merge_post_detail(post, {
         "video_view_count": 414739,
