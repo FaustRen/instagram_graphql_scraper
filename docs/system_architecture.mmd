@@ -1,0 +1,76 @@
+flowchart TD
+    classDef caller fill:#eef2ff,stroke:#33415c,stroke-width:1px,color:#1a1a1a;
+    classDef coordinator fill:#bcd4ff,stroke:#1d3557,stroke-width:2px,color:#1a1a1a;
+    classDef browser fill:#d8f3dc,stroke:#2d6a4f,stroke-width:1px,color:#1a1a1a;
+    classDef sync fill:#fff3cd,stroke:#a67c00,stroke-width:1px,color:#1a1a1a;
+    classDef async fill:#f7d6e0,stroke:#9d174d,stroke-width:1px,color:#1a1a1a;
+    classDef parse fill:#eeeeee,stroke:#555555,stroke-width:1px,stroke-dasharray: 3 3,color:#1a1a1a;
+    classDef external fill:#ffddb3,stroke:#8a4b00,stroke-width:1px,color:#1a1a1a;
+    classDef result fill:#d7f5dc,stroke:#2d6a4f,stroke-width:2px,color:#1a1a1a;
+
+    Caller["Caller script\nexample.py / manual_integration.py"]:::caller
+
+    subgraph Coordinator["scraper.py: InstagramGraphqlScraper"]
+        GUP["get_user_posts()\nvalidate params, orchestrate pagination"]:::coordinator
+        EP["enrich_posts()\nauto-run only if enrich_details=True\nsync, in-process, one call"]:::sync
+    end
+
+    subgraph BrowserLayer["Browser automation (Selenium Wire)"]
+        BasePageC["BasePage\nbase/base.py\nChrome driver bootstrap"]:::browser
+        PageOptC["PageOptional\npages/page_optional.py\nopen profile, dismiss login,\nscroll, click show-more"]:::browser
+    end
+
+    subgraph GraphQLLayer["graphql.py: capture, paginate, normalize"]
+        Matcher["is_target_graphql_request()\ncapture_request()"]:::coordinator
+        PageParse["parse_connection()\nnormalize_edge()\nparse_accessibility_date()"]:::parse
+    end
+
+    Session["requests.Session\nshared: pagination replay\n+ sync detail fetch"]:::sync
+
+    subgraph SyncDetail["Sync detail parsing (used by enrich_posts)"]
+        CtxPy["instagram_context_json.py\nextract_context_json / normalize_media\n(also a standalone single-post CLI)"]:::parse
+        EmbedNorm["embed.py\nnormalize_embed_html()"]:::parse
+        DetailPy["detail.py\nparse_post_detail_html()\nmerge_post_detail()"]:::parse
+    end
+
+    subgraph AsyncDetail["Async detail client (opt-in only)"]
+        EmbedClient["InstagramEmbedClient\nembed.py\nhttpx.AsyncClient, Semaphore,\n_tasks dedup scoped to this instance"]:::async
+    end
+
+    Result["list of post dicts\nreturned to caller;\nenrichment mutates dicts in place"]:::result
+
+    subgraph Instagram["External network: instagram.com"]
+        ProfilePage["Profile page\n(browser navigation)"]:::external
+        GraphQLEndpoint["POST /api/graphql\nfirst call via browser,\nreplayed via requests.Session"]:::external
+        EmbedPage["GET /p or /reel/{shortcode}/embed/captioned/"]:::external
+        PostPage["GET /p or /reel/{shortcode}/"]:::external
+    end
+
+    Caller -->|construct + call| GUP
+    GUP -->|"1 capture_first_page()"| BasePageC
+    BasePageC --> PageOptC
+    PageOptC -->|driver.get| ProfilePage
+    PageOptC -->|click show-more triggers XHR| GraphQLEndpoint
+    GraphQLEndpoint -->|Selenium Wire captures request+response| Matcher
+    Matcher -->|CapturedRequest: url, headers, cookies, payload| GUP
+    GUP --> PageParse
+    PageParse -->|posts, cursor, has_next| GUP
+    GUP -->|"2 _request_next_page(cursor) with retry"| Session
+    Session -->|POST replayed payload| GraphQLEndpoint
+    GraphQLEndpoint -->|JSON response| PageParse
+
+    GUP -->|"3 if enrich_details: enrich_posts(posts)"| EP
+    EP -->|"_get_detail_response() with retry"| Session
+    Session -->|GET| EmbedPage
+    Session -->|"GET, only if taken_at_timestamp still missing"| PostPage
+    EmbedPage --> EmbedNorm
+    EmbedNorm --> CtxPy
+    EmbedNorm -.->|fallback when contextJSON parse fails| DetailPy
+    PostPage --> DetailPy
+    EP -->|merge_post_detail per post| Result
+    GUP --> Result
+    Result --> Caller
+
+    Caller -.->|"opt-in: await enrich_posts_async(posts, ...)\nor use InstagramEmbedClient directly"| EmbedClient
+    EmbedClient -->|GET, bounded concurrency, own retry| EmbedPage
+    EmbedClient -.->|"merge_post_detail per post,\npreserves input order"| Result
