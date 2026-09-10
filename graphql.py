@@ -67,33 +67,50 @@ def parse_form_payload(body: bytes | str | None) -> tuple[dict[str, str], dict[s
     return payload, variables
 
 
+def _decode_response_bytes(body: bytes | str | None, encoding: str | None) -> bytes:
+    """Decompress a raw response body according to its content encoding."""
+    if not body:
+        raise InstagramGraphQLError("Response body is empty")
+    raw = body.encode("utf-8") if isinstance(body, str) else body
+    content_encoding = (encoding or "identity").lower().strip()
+    if content_encoding not in {"identity", ""}:
+        try:
+            from seleniumwire.utils import decode
+            raw = decode(raw, content_encoding)
+            content_encoding = "identity"
+        except (ImportError, OSError, ValueError):
+            pass
+    if content_encoding == "gzip":
+        raw = gzip.decompress(raw)
+    elif content_encoding == "deflate":
+        raw = zlib.decompress(raw)
+    elif content_encoding == "br":
+        import brotli
+        raw = brotli.decompress(raw)
+    return raw
+
+
 def decode_response_body(body: bytes | str | None, encoding: str | None) -> dict[str, Any]:
     """Decode compressed response bytes and parse the JSON object."""
     if not body:
         raise InstagramGraphQLError("GraphQL response body is empty")
-    raw = body.encode("utf-8") if isinstance(body, str) else body
-    content_encoding = (encoding or "identity").lower().strip()
     try:
-        if content_encoding not in {"identity", ""}:
-            try:
-                from seleniumwire.utils import decode
-                raw = decode(raw, content_encoding)
-                content_encoding = "identity"
-            except (ImportError, OSError, ValueError):
-                pass
-        if content_encoding == "gzip":
-            raw = gzip.decompress(raw)
-        elif content_encoding == "deflate":
-            raw = zlib.decompress(raw)
-        elif content_encoding == "br":
-            import brotli
-            raw = brotli.decompress(raw)
+        raw = _decode_response_bytes(body, encoding)
         value = json.loads(raw.decode("utf-8"))
     except (ImportError, OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InstagramGraphQLError("GraphQL response is not valid JSON") from error
     if not isinstance(value, dict):
         raise InstagramGraphQLError("GraphQL response JSON must be an object")
     return value
+
+
+def decode_response_text(body: bytes | str | None, encoding: str | None) -> str:
+    """Decode compressed response bytes into an HTML document string."""
+    try:
+        raw = _decode_response_bytes(body, encoding)
+        return raw.decode("utf-8", errors="replace")
+    except (ImportError, OSError, ValueError) as error:
+        raise InstagramGraphQLError("Profile document response could not be decoded") from error
 
 
 def request_debug_summary(requests: Any) -> str:
@@ -184,6 +201,92 @@ def normalize_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
             if taken_at_timestamp is not None else None
         ),
     }
+
+
+PRELOADED_SCRIPT_PATTERN = re.compile(
+    r'<script(?=[^>]*type="application/json")(?=[^>]*data-sjs)[^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _find_all_timeline_connections(value: Any) -> list[Mapping[str, Any]]:
+    """Recursively collect embedded polaris_ordered_timeline_connection objects."""
+    found: list[Mapping[str, Any]] = []
+    if isinstance(value, Mapping):
+        connection = value.get("polaris_ordered_timeline_connection")
+        if isinstance(connection, Mapping) and isinstance(connection.get("edges"), list):
+            found.append(connection)
+        for child in value.values():
+            found.extend(_find_all_timeline_connections(child))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_find_all_timeline_connections(item))
+    return found
+
+
+def parse_preloaded_posts(html: str) -> list[dict[str, Any]]:
+    """Extract profile posts embedded in the initial profile page HTML.
+
+    Instagram preloads the first ~12 timeline posts inside inline
+    ``<script type="application/json" data-sjs>`` tags on the profile page
+    itself, ahead of any GraphQL pagination request. Those posts are
+    otherwise missing from the paginated timeline.
+    """
+    posts: list[dict[str, Any]] = []
+    seen_shortcodes: set[str] = set()
+    for match in PRELOADED_SCRIPT_PATTERN.finditer(html or ""):
+        raw = match.group(1)
+        if "polaris_ordered_timeline_connection" not in raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for connection in _find_all_timeline_connections(payload):
+            for edge in connection["edges"]:
+                try:
+                    post = normalize_edge(edge)
+                except InstagramGraphQLError:
+                    continue
+                shortcode = post.get("shortcode")
+                if not shortcode or shortcode in seen_shortcodes:
+                    continue
+                seen_shortcodes.add(shortcode)
+                posts.append(post)
+    return posts
+
+
+def find_profile_document_request(requests: Any, username: str) -> Any | None:
+    """Find the initial profile page HTML document request, if captured."""
+    target_path = f"/{username.strip('/')}/"
+    for request in requests:
+        parsed_url = urlparse(str(getattr(request, "url", "")))
+        if parsed_url.path != target_path:
+            continue
+        if str(getattr(request, "method", "")).upper() != "GET":
+            continue
+        response = getattr(request, "response", None)
+        if response is None or not 200 <= int(getattr(response, "status_code", 0)) < 300:
+            continue
+        content_type = _header(getattr(response, "headers", {}), "content-type") or ""
+        if "text/html" not in content_type.lower():
+            continue
+        return request
+    return None
+
+
+def extract_preloaded_posts(requests: Any, username: str) -> list[dict[str, Any]]:
+    """Find the profile document response and parse its embedded posts."""
+    request = find_profile_document_request(requests, username)
+    response = getattr(request, "response", None) if request is not None else None
+    if response is None:
+        return []
+    encoding = _header(getattr(response, "headers", {}), "content-encoding")
+    try:
+        html = decode_response_text(response.body, encoding)
+    except InstagramGraphQLError:
+        return []
+    return parse_preloaded_posts(html)
 
 
 def parse_accessibility_date(value: str | None):

@@ -11,10 +11,13 @@ from graphql import (
     InstagramGraphQLError,
     capture_request,
     decode_response_body,
+    extract_preloaded_posts,
+    find_profile_document_request,
     is_target_graphql_request,
     next_payload,
     parse_connection,
     parse_form_payload,
+    parse_preloaded_posts,
     redact_headers,
     parse_accessibility_date,
 )
@@ -191,6 +194,97 @@ def test_days_limit_filters_old_posts_and_signals_pagination_stop():
     )
     assert [post["post_id"] for post in filtered] == ["new", "unknown"]
     assert reached_cutoff is True
+
+
+def _preloaded_profile_html(shortcodes):
+    """Build a sanitized profile document fixture with embedded preloaded posts."""
+    edges = [
+        {
+            "node": {
+                "pk": f"pk-{code}",
+                "id": f"POLARIS_{code}",
+                "code": code,
+                "media_type": 1,
+                "user": {"pk": "u1", "username": "demo", "id": "U1"},
+            },
+            "cursor": f"edge-{code}",
+        }
+        for code in shortcodes
+    ]
+    preloaded = {
+        "require": [[
+            "RelayPrefetchedStreamCache", "next", [{}, {
+                "adp_PolarisLoggedOutDesktopWWWProfilePostsTabContentQueryRelayPreloader_x": {
+                    "__bbox": {
+                        "complete": True,
+                        "result": {
+                            "data": {
+                                "xig_user_by_username": {
+                                    "pk": "u1",
+                                    "polaris_ordered_timeline_connection": {
+                                        "edges": edges,
+                                        "page_info": {"end_cursor": "c1", "has_next_page": True},
+                                    },
+                                }
+                            }
+                        },
+                    }
+                }
+            }]
+        ]]
+    }
+    script = json.dumps(preloaded)
+    return f'<html><head><script type="application/json" data-sjs>{script}</script></head></html>'
+
+
+def test_parse_preloaded_posts_extracts_embedded_timeline_edges():
+    """Verify preloaded posts embedded in the profile document are parsed."""
+    html = _preloaded_profile_html(["a1", "a2"])
+    posts = parse_preloaded_posts(html)
+    assert [post["shortcode"] for post in posts] == ["a1", "a2"]
+    assert posts[0]["post_id"] == "pk-a1"
+
+
+def test_parse_preloaded_posts_ignores_unrelated_scripts_and_dedupes():
+    """Verify unrelated scripts are skipped and duplicate shortcodes are removed."""
+    html = _preloaded_profile_html(["a1", "a1"]) + '<script type="application/json" data-sjs>{"other": true}</script>'
+    posts = parse_preloaded_posts(html)
+    assert [post["shortcode"] for post in posts] == ["a1"]
+
+
+def test_find_profile_document_request_matches_html_get_by_path():
+    """Verify the profile document request is matched by path, method, and content type."""
+    html_response = SimpleNamespace(status_code=200, body=b"<html></html>", headers={"Content-Type": "text/html; charset=utf-8"})
+    other_path = SimpleNamespace(method="GET", url="https://www.instagram.com/other/", response=html_response)
+    wrong_method = SimpleNamespace(method="POST", url="https://www.instagram.com/demo/", response=html_response)
+    match = SimpleNamespace(method="GET", url="https://www.instagram.com/demo/", response=html_response)
+    assert find_profile_document_request([other_path, wrong_method, match], "demo") is match
+    assert find_profile_document_request([other_path, wrong_method], "demo") is None
+
+
+def test_extract_preloaded_posts_decodes_and_parses_document_response():
+    """Verify extract_preloaded_posts decodes the response body and parses posts."""
+    html = _preloaded_profile_html(["b1"])
+    response = SimpleNamespace(status_code=200, body=html.encode(), headers={"Content-Type": "text/html"})
+    request = SimpleNamespace(method="GET", url="https://www.instagram.com/demo/", response=response)
+    posts = extract_preloaded_posts([request], "demo")
+    assert [post["shortcode"] for post in posts] == ["b1"]
+
+
+def test_extract_preloaded_posts_returns_empty_when_document_missing():
+    """Verify a missing profile document request yields no preloaded posts."""
+    assert extract_preloaded_posts([], "demo") == []
+
+
+def test_merge_preloaded_posts_prepends_and_deduplicates_by_identity():
+    """Verify preloaded posts are prepended ahead of paginated posts without duplicates."""
+    scraper = InstagramGraphqlScraper(driver=object())
+    scraper.preloaded_posts = [
+        {"post_id": "p1", "shortcode": "s1"},
+        {"post_id": "p2", "shortcode": "s2"},
+    ]
+    posts = scraper._merge_preloaded_posts([{"post_id": "p2", "shortcode": "s2"}, {"post_id": "p3", "shortcode": "s3"}])
+    assert [post["post_id"] for post in posts] == ["p1", "p2", "p3"]
 
 
 def test_post_detail_html_parses_exact_counts_and_timestamp():
