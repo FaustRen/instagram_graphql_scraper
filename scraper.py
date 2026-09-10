@@ -21,6 +21,7 @@ try:
     from .graphql import (
         InstagramGraphQLError,
         capture_request,
+        extract_preloaded_posts,
         is_target_graphql_request,
         log_capture,
         next_payload,
@@ -33,6 +34,7 @@ except ImportError:
     from graphql import (
         InstagramGraphQLError,
         capture_request,
+        extract_preloaded_posts,
         is_target_graphql_request,
         log_capture,
         next_payload,
@@ -76,6 +78,7 @@ class InstagramGraphqlScraper:
         self.session = requests.Session()
         self.captured_request: CapturedRequest | None = None
         self.enrich_details = enrich_details
+        self.preloaded_posts: list[dict[str, Any]] = []
 
     def _build_driver(self) -> Any:
         """Create the Selenium Wire driver when one was not supplied."""
@@ -96,6 +99,11 @@ class InstagramGraphqlScraper:
             from pages.page_optional import PageOptional
         page = PageOptional(self.driver, self.ig_account, self.ig_pwd, self.logger)
         page.open_profile(username)
+        try:
+            self.preloaded_posts = extract_preloaded_posts(self.driver.requests, username)
+        except Exception as error:
+            self.logger.debug("Could not extract preloaded profile posts: %s", error)
+            self.preloaded_posts = []
         page.close_login_prompt()
         page.scroll_window()
         page.clear_requests()
@@ -184,6 +192,7 @@ class InstagramGraphqlScraper:
         )
         captured = self.capture_first_page(username)
         posts, cursor, has_next = parse_connection(captured.first_response)
+        posts = self._merge_preloaded_posts(posts)
         seen_posts = {post.get("post_id") or post.get("graphql_id") or post.get("shortcode") for post in posts}
         seen_cursors = {cursor} if cursor else set()
         page_count = 1
@@ -220,6 +229,20 @@ class InstagramGraphqlScraper:
         if self.enrich_details:
             self.enrich_posts(posts)
         return posts
+
+    def _merge_preloaded_posts(self, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Prepend posts embedded in the initial profile page, deduplicated."""
+        if not self.preloaded_posts:
+            return posts
+        seen_posts = set()
+        merged = []
+        for post in [*self.preloaded_posts, *posts]:
+            identity = post.get("post_id") or post.get("graphql_id") or post.get("shortcode")
+            if identity in seen_posts:
+                continue
+            seen_posts.add(identity)
+            merged.append(post)
+        return merged
 
     @staticmethod
     def _filter_posts_by_days(
