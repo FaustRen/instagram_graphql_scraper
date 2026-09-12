@@ -50,9 +50,9 @@ class PostDetailParser(HTMLParser):
         """Finalize an exact count when its anchor closes."""
         if tag == "a" and self._count_anchor:
             text = "".join(self._count_text)
-            match = re.search(r"([\d,]+)\s+(?:likes|comments)", text, re.IGNORECASE)
+            match = re.search(r"\d[\d,\s]*", text.strip())
             if match:
-                count = int(match.group(1).replace(",", ""))
+                count = int(re.sub(r"[^\d]", "", match.group()))
                 field = "like_count" if self._count_anchor == "likeCountClick" else "comment_count"
                 self.exact_counts[field] = count
             self._count_anchor = None
@@ -123,18 +123,27 @@ def parse_post_detail_html(html: str, shortcode: str | None = None) -> dict[str,
     parser = PostDetailParser()
     parser.feed(html)
     description = parser.meta.get("description") or parser.meta.get("og:description") or ""
-    like_count, likes_approximate = _parse_count(description, "likes")
-    comment_count, comments_approximate = _parse_count(description, "comments")
-    if "like_count" in parser.exact_counts:
-        like_count, likes_approximate = parser.exact_counts["like_count"], False
-    if "comment_count" in parser.exact_counts:
-        comment_count, comments_approximate = parser.exact_counts["comment_count"], False
     embedded_like_count = _parse_embedded_count(html, "edge_liked_by")
     embedded_comment_count = _parse_embedded_count(html, "edge_media_to_comment")
-    if embedded_like_count is not None:
-        like_count, likes_approximate = embedded_like_count, False
-    if embedded_comment_count is not None:
-        comment_count, comments_approximate = embedded_comment_count, False
+    metadata_like_count, likes_approximate = _parse_count(description, "likes")
+    metadata_comment_count, comments_approximate = _parse_count(description, "comments")
+    like_count = embedded_like_count
+    comment_count = embedded_comment_count
+    if like_count is None:
+        like_count = metadata_like_count
+    else:
+        likes_approximate = False
+    if comment_count is None:
+        comment_count = metadata_comment_count
+    else:
+        comments_approximate = False
+    used_anchor_count = False
+    if like_count is None and "like_count" in parser.exact_counts:
+        like_count, likes_approximate = parser.exact_counts["like_count"], False
+        used_anchor_count = True
+    if comment_count is None and "comment_count" in parser.exact_counts:
+        comment_count, comments_approximate = parser.exact_counts["comment_count"], False
+        used_anchor_count = True
     video_view_count, _ = _parse_count(description, "views")
     if video_view_count is None:
         video_view_count, _ = _parse_count(description, "plays")
@@ -150,7 +159,7 @@ def parse_post_detail_html(html: str, shortcode: str | None = None) -> dict[str,
         "published_at": published_at,
         "like_count_is_approximate": likes_approximate,
         "comment_count_is_approximate": comments_approximate,
-        "detail_source": "post_embed_html" if parser.exact_counts or embedded_like_count is not None or embedded_comment_count is not None else ("post_html_metadata" if description or parser.times else None),
+        "detail_source": "post_embed_html" if used_anchor_count or embedded_like_count is not None or embedded_comment_count is not None else ("post_html_metadata" if description or parser.times else None),
         "detail_shortcode": shortcode,
     }
 

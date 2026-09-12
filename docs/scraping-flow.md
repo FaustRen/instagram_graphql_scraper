@@ -221,7 +221,16 @@ flowchart TD
 - 同一 `shortcode` 第二次出現時是「快取命中」，不會再發 HTTP 請求，也**不會**影響 `consecutive_failures` 計數。
 - `consecutive_failures` 只在「本次是新 shortcode 且請求或解析失敗」時遞增，達到 `3` 就中止整個迴圈；已經處理過的貼文結果保留，尚未處理到的貼文維持原始 timeline 欄位，不會被丟棄。
 - 失敗時 `cache[shortcode]` 存入的是空字典 `{}`，不是清空整個 `cache`；空字典等同「這個 shortcode 已經查過、沒有資料」，之後同一 shortcode 再出現會直接命中這個空結果，不會重新嘗試。
-- `merge_post_detail`（`detail.py:158-176`）只在 `post` 對應欄位為 `None` 時才會填入 `detail` 的值，缺不覆蓋已存在的值；並且只有 `detail` 本身有該欄位時才會設定，因此 `video_duration`、`video_url`、`like_count_is_approximate`、`comment_count_is_approximate`、`detail_source` 等欄位在補資料失敗或未執行補資料時，可能完全不存在於回傳的 `post` dict 中（不是 key 存在但值為 `None`）。
+- `merge_post_detail`（`detail.py:167-188`）只在 `post` 對應欄位為 `None` 時才會填入 `detail` 的值，缺不覆蓋已存在的值；並且只有 `detail` 本身有該欄位時才會設定，因此 `video_duration`、`video_url`、`like_count_is_approximate`、`comment_count_is_approximate`、`detail_source` 等欄位在補資料失敗或未執行補資料時，可能完全不存在於回傳的 `post` dict 中（不是 key 存在但值為 `None`）。
+
+`normalize_embed_html` 會先解析 embed `contextJSON`。若其中的
+`like_count` 或 `comment_count` 仍為 `None`，則使用同一份已取得的 HTML，
+依序嘗試 embedded structured data、metadata，最後才以
+`a[data-log-event="likeCountClick"]` 與
+`a[data-log-event="captionCommentsClick"]` 作為精確數值 fallback。anchor
+文字不限定語系，數字可含千分位、空白、換行或巢狀標籤；兩個欄位分別判斷，
+只填補 `None`，因此既有有效值與 integer `0` 都不會被覆蓋。這段 fallback
+直接解析既有 embed response，不會為相同 embed URL 再發一次請求。
 
 ### 七之一、`_get_detail_response` 重試策略
 
@@ -282,7 +291,7 @@ flowchart TD
 與同步路徑的差異（原始碼確認，非猜測）：
 
 - 沒有「連續失敗達到門檻即中止」的機制；每一篇貼文都會各自嘗試、互不影響（`embed.py:79-129`）。
-- 沒有同步路徑的「`taken_at_timestamp` 缺失時再抓一次一般貼文頁面補日期」邏輯；`normalize_embed_html` 內部雖然一樣會在 contextJSON 解析失敗時退回 HTML 指標解析，但整個非同步流程只對 embed URL 發一次請求，不會像同步路徑一樣針對缺 timestamp 再多發一次一般頁面請求。
+- 沒有同步路徑的「`taken_at_timestamp` 缺失時再抓一次一般貼文頁面補日期」邏輯；`normalize_embed_html` 會在 contextJSON 解析失敗，或 contextJSON 的 likes/comments 缺失時，使用同一份 embed HTML 執行 fallback。整個非同步流程只對 embed URL 發一次請求，不會像同步路徑一樣針對缺 timestamp 再多發一次一般頁面請求。
 - 任務去重（`_tasks` 字典）只在單一 `InstagramEmbedClient` 執行個體、單次 `fetch_many` 呼叫的存活期間有效；`enrich_posts_async` 每次呼叫都會建立新的 `InstagramEmbedClient`（`async with`），結束時透過 `__aexit__` 呼叫 `aclose()` 關閉內部持有的 `httpx.AsyncClient`；`_tasks` 字典本身沒有顯式清空，但隨物件生命週期結束一併釋放。
 - 若外部自行傳入 `client=` 給 `InstagramEmbedClient`，物件不會擁有該 client（`_owns_client=False`），結束時不會關閉它，需由外部自行管理。
 
@@ -323,7 +332,7 @@ comment_count_is_approximate, detail_source
 | `EnrichLoop`、`CacheCheck`、`FailLimitCheck` 分支標籤使用 `Yes/No` 但語意不同（例如 `DetailRetry -->|No/Success|`、`AsyncRetry -->|Success/Fail|`） | 各分支語意應分開標示，避免同一個 `Yes/No` 對應不同結果 | 全篇 | 新版所有分支改為描述性標籤，例如「reached_cutoff is True／False」、「cache hit／first time this run」 |
 | 沒有畫出「第一頁即 reached_cutoff 時是否還會多抓一頁」 | 第一頁篩選後若 `reached_cutoff` 為真，`has_next` 直接設為 `False`，迴圈條件當次即為假，不會再送出下一頁請求 | `scraper.py:190-193` | 分頁子流程圖新增此節點並在文字補充說明，已用本機模擬確認 |
 | 沒有畫出分頁失敗會讓已收集資料一併遺失 | `_request_next_page` 重試耗盡後 `raise`，`get_user_posts` 沒有攔截，已收集的 `posts` 不會被回傳 | `scraper.py:198` 與呼叫鏈 | 總覽圖與分頁子流程圖均新增此例外出口，已用本機模擬確認 |
-| 沒有畫出補資料合併欄位（`video_duration`、`video_url` 等）可能完全不存在於回傳結果中 | `merge_post_detail` 只在 `detail` 有該欄位時才設定，欄位可能整個不存在，不是「存在但為 None」 | `detail.py:158-176` | 於第九節列出「保證存在」與「可能不存在」兩組欄位 |
+| 沒有畫出補資料合併欄位（`video_duration`、`video_url` 等）可能完全不存在於回傳結果中 | `merge_post_detail` 只在 `detail` 有該欄位時才設定，欄位可能整個不存在，不是「存在但為 None」 | `detail.py:167-188` | 於第九節列出「保證存在」與「可能不存在」兩組欄位 |
 | 沒有畫出 `close()` 由呼叫端負責 | `get_user_posts` 內沒有呼叫 `close()`，所有清理都在 `example.py` / `manual_integration.py` 的 `finally` 區塊 | `scraper.py:333-338`、`example.py`、`manual_integration.py` | 總覽圖與第九節明確標示 |
 
 ## 十一、驗證範圍與方法

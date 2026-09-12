@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-09-13
+
+### Fixed
+- Parse exact like and comment counts from stable Embed anchor attributes
+  without depending on English display text.
+- Fill only missing count fields from the existing Embed HTML response while
+  preserving primary values, including integer zero, and avoiding duplicate
+  Embed requests.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added
