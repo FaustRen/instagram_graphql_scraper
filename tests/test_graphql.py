@@ -308,16 +308,55 @@ def test_post_detail_html_marks_rounded_counts_and_reads_video_views():
     assert detail["like_count_is_approximate"] is True
 
 
-def test_post_embed_html_prefers_exact_anchor_counts_over_rounded_description():
-    """Verify exact Embed anchor counts override rounded descriptions."""
+def test_post_embed_html_anchor_counts_do_not_override_metadata():
+    """Verify anchor fallback does not replace counts parsed from metadata."""
     html = '<meta name="description" content="14K likes, 60 comments - demo on July 26, 2026">'
     html += '<a data-log-event="likeCountClick">7,320,872 likes</a>'
     html += '<a data-log-event="captionCommentsClick">View all 62,125 comments</a>'
     detail = parse_post_detail_html(html, "CODE")
-    assert detail["like_count"] == 7320872
-    assert detail["comment_count"] == 62125
-    assert detail["like_count_is_approximate"] is False
-    assert detail["detail_source"] == "post_embed_html"
+    assert detail["like_count"] == 14000
+    assert detail["comment_count"] == 60
+    assert detail["like_count_is_approximate"] is True
+
+
+def test_post_embed_html_parses_localized_anchor_counts_independently():
+    """Verify localized anchor text is parsed by stable event attributes."""
+    likes = parse_post_detail_html(
+        '<a data-log-event="likeCountClick"> 43,607 個讚 </a>'
+    )
+    comments = parse_post_detail_html(
+        '<a data-log-event="captionCommentsClick">\n查看所有 560 則留言\n</a>'
+    )
+    assert likes["like_count"] == 43607
+    assert type(likes["like_count"]) is int
+    assert likes["comment_count"] is None
+    assert comments["like_count"] is None
+    assert comments["comment_count"] == 560
+    assert type(comments["comment_count"]) is int
+
+
+def test_post_embed_html_parses_nested_anchor_text_and_ignores_other_elements():
+    """Verify nested target text works and unrelated numeric content is ignored."""
+    html = '''
+        <a data-log-event="captionCommentsClick">
+            <span>查看所有</span><strong>560</strong><span>則留言</span>
+        </a>
+        <a data-log-event="otherEvent">999</a>
+        <div>12345</div>
+    '''
+    detail = parse_post_detail_html(html)
+    assert detail["like_count"] is None
+    assert detail["comment_count"] == 560
+
+
+def test_post_embed_html_fills_only_the_missing_count():
+    """Verify likes and comments use anchor fallback independently."""
+    html = '<meta name="description" content="100 likes">'
+    html += '<a data-log-event="likeCountClick">999 個讚</a>'
+    html += '<a data-log-event="captionCommentsClick">查看所有 20 則留言</a>'
+    detail = parse_post_detail_html(html)
+    assert detail["like_count"] == 100
+    assert detail["comment_count"] == 20
 
 
 def test_post_embed_html_parses_structured_exact_counts_when_anchor_variant_changes():
@@ -352,15 +391,15 @@ def test_detail_merge_does_not_overwrite_existing_exact_values():
     assert post == {"like_count": 10, "comment_count": 4, "published_at": "2026-07-05"}
 
 
-def _embed_html(shortcode, typename="GraphVideo"):
+def _embed_html(shortcode, typename="GraphVideo", like_count=12, comment_count=3):
     """Build a sanitized contextJSON Embed fixture."""
     media = {
         "__typename": typename,
         "id": f"media-{shortcode}",
         "shortcode": shortcode,
         "edge_media_to_caption": {"edges": [{"node": {"text": "caption"}}]},
-        "edge_liked_by": {"count": 12},
-        "edge_media_to_comment": {"count": 3},
+        "edge_liked_by": {"count": like_count},
+        "edge_media_to_comment": {"count": comment_count},
         "video_view_count": 99,
         "video_duration": 4.5,
         "display_url": "https://example.com/image.jpg",
@@ -370,6 +409,64 @@ def _embed_html(shortcode, typename="GraphVideo"):
     }
     context = {"gql_data": {"shortcode_media": media}}
     return '"contextJSON":' + json.dumps(json.dumps(context))
+
+
+def test_context_json_counts_are_not_overridden_by_anchor_fallback():
+    """Verify valid primary context counts remain authoritative."""
+    html = _embed_html("primary", like_count=100, comment_count=20)
+    html += '<a data-log-event="likeCountClick">999 個讚</a>'
+    html += '<a data-log-event="captionCommentsClick">查看所有 888 則留言</a>'
+    detail = normalize_embed_html(html, "primary")
+    assert detail["like_count"] == 100
+    assert detail["comment_count"] == 20
+
+
+def test_context_json_zero_counts_are_not_treated_as_missing():
+    """Verify integer zero does not trigger anchor fallback."""
+    html = _embed_html("zero", like_count=0, comment_count=0)
+    html += '<a data-log-event="likeCountClick">999 個讚</a>'
+    html += '<a data-log-event="captionCommentsClick">查看所有 888 則留言</a>'
+    detail = normalize_embed_html(html, "zero")
+    assert detail["like_count"] == 0
+    assert detail["comment_count"] == 0
+    assert type(detail["like_count"]) is int
+    assert type(detail["comment_count"]) is int
+
+
+def test_context_json_uses_anchor_fallback_only_for_each_missing_count():
+    """Verify each missing context count is filled without replacing its peer."""
+    html = _embed_html("partial", like_count=100, comment_count=None)
+    html += '<a data-log-event="likeCountClick">999 個讚</a>'
+    html += '<a data-log-event="captionCommentsClick">查看所有 560 則留言</a>'
+    detail = normalize_embed_html(html, "partial")
+    assert detail["like_count"] == 100
+    assert detail["comment_count"] == 560
+
+    inverse_html = _embed_html("inverse", like_count=None, comment_count=20)
+    inverse_html += '<a data-log-event="captionCommentsClick">999 則留言</a>'
+    inverse = normalize_embed_html(inverse_html, "inverse")
+    assert inverse["like_count"] is None
+    assert inverse["comment_count"] == 20
+
+
+def test_sync_enrichment_uses_one_embed_request_for_localized_fallback():
+    """Verify sync enrichment parses fallback counts from its existing response."""
+    scraper = InstagramGraphqlScraper(driver=object())
+    html = _embed_html("sync", like_count=None, comment_count=None)
+    html += '<a data-log-event="likeCountClick">43,607 個讚</a>'
+    html += '<a data-log-event="captionCommentsClick">查看所有 560 則留言</a>'
+    requested_urls = []
+
+    def get_detail_response(url):
+        requested_urls.append(url)
+        return SimpleNamespace(text=html)
+
+    scraper._get_detail_response = get_detail_response
+    posts = [{"shortcode": "sync", "media_type": 1}]
+    scraper.enrich_posts(posts)
+    assert posts[0]["like_count"] == 43607
+    assert posts[0]["comment_count"] == 560
+    assert requested_urls.count("https://www.instagram.com/p/sync/embed/captioned/") == 1
 
 
 def test_normalize_media_handles_video_image_and_carousel():
@@ -496,3 +593,10 @@ def test_merge_includes_video_detail_fields():
     assert post["video_view_count"] == 414739
     assert post["video_duration"] == 140.966
     assert post["video_url"] == "https://example.com/video.mp4"
+
+
+def test_merge_post_detail_preserves_zero_and_existing_counts():
+    """Verify detail merging fills only None and preserves zero counts."""
+    post = {"like_count": 0, "comment_count": 7}
+    merge_post_detail(post, {"like_count": 50, "comment_count": 60})
+    assert post == {"like_count": 0, "comment_count": 7}

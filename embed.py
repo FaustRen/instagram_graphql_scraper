@@ -160,7 +160,13 @@ def normalize_embed_html(html: str, shortcode: str | None = None) -> dict[str, A
     """Normalize context JSON, falling back to exact HTML metrics when needed."""
     try:
         context = extract_context_json(html)
-        return normalize_media(get_media(context))
+        normalized = normalize_media(get_media(context))
+        if normalized.get("like_count") is None or normalized.get("comment_count") is None:
+            fallback = parse_post_detail_html(html, shortcode)
+            for field in ("like_count", "comment_count"):
+                if normalized.get(field) is None and fallback.get(field) is not None:
+                    normalized[field] = fallback[field]
+        return normalized
     except (ValueError, KeyError) as error:
         fallback = parse_post_detail_html(html, shortcode)
         if fallback.get("detail_source"):
